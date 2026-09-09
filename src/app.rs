@@ -736,7 +736,7 @@ impl<B: Backend> App<B> {
     ///
     /// Runs once per loop tick, right after [`App::reap_exited`] +
     /// [`App::drain_bus`] have settled every pane's state for this frame. Only
-    /// **changes** are recorded (compared against `last_status`), so a steady
+    /// **changes** are recorded using each slot's `last_status`, so a steady
     /// agent produces no events.
     ///
     /// Tool events from the OSC `toolName` payload are deliberately NOT recorded

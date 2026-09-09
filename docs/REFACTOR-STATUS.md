@@ -27,12 +27,12 @@
 ```text
 cargo fmt --check
 cargo check --lib
-cargo test --lib
+cargo test -- --test-threads=1
 cargo clippy --all-targets --all-features
 ```
 
 当前环境中 `cargo fmt --check`、`cargo check --lib` 和完整测试
-`cargo test -- --test-threads=1` 已通过（库 `441 passed, 6 ignored`，其他 targets 与 doctest
+`cargo test -- --test-threads=1` 已通过（库 `442 passed, 6 ignored`，其他 targets 与 doctest
 也通过）。移动端 pairing token 使用进程内单调计数器避免高速调用碰撞。Clippy 可执行，但仓库还存在若干历史 lint（主要是 unused/dead-code、
 signal handler 和跨模块风格建议），后续可单独清理，不应把这些 warning 误认为协议或行为回归。
 
