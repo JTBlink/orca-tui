@@ -11,7 +11,6 @@ use crate::sidebar::SidebarEntry;
 #[derive(Debug, Clone)]
 pub(crate) struct RenderModel {
     pub(crate) sidebar_entries: Vec<SidebarEntry>,
-    pub(crate) statuses: Vec<AgentStatus>,
     pub(crate) tally: crate::agent::StatusTally,
 }
 
@@ -43,7 +42,6 @@ impl RenderModel {
         let tally = status_tally(&statuses);
         Self {
             sidebar_entries,
-            statuses,
             tally,
         }
     }
@@ -62,7 +60,7 @@ mod tests {
         let model = RenderModel::from_slots(&[first, second], 1);
         assert!(model.sidebar_entries[0].pinned);
         assert!(model.sidebar_entries[1].focused);
-        assert_eq!(model.statuses.len(), 2);
+        assert_eq!(model.sidebar_entries.len(), 2);
         assert_eq!(model.tally.total(), 2);
     }
 }

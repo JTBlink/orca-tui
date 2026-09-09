@@ -42,7 +42,7 @@ use crate::activity::{ActivityEvent, ActivityLog};
 use crate::agent::{AgentKind, AgentSpec, AgentState, AgentStatus};
 use crate::bus::{self, AgentUpdate, AgentUpdateReceiver, AgentUpdateSender};
 use crate::config::{Config, LayoutConfig};
-use crate::coordinator::{self, Coordinator};
+use crate::coordinator::Coordinator;
 use crate::daemon_connection::DaemonConnection;
 use crate::input::{self, FocusDirection as FocusDir, InputCommand, InputMode};
 use crate::integrations::RepoRef;
@@ -1456,7 +1456,7 @@ impl<B: Backend> App<B> {
             let dispatch = self
                 .coordinator
                 .as_mut()
-                .and_then(|c| c.dispatch_next(&[agent.clone()]));
+                .and_then(|c| c.dispatch_next(std::slice::from_ref(&agent)));
             let Some(dispatch) = dispatch else {
                 break;
             };
