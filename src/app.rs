@@ -288,9 +288,10 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// message + "press Esc" instead of the item list.
     tasks_error: Option<String>,
     /// GitHub task-list fetch running off the UI thread.
-    tasks_fetch_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<Vec<TasksEntry>>>>,
-    task_body_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    tasks_fetch_rx: Option<std::sync::mpsc::Receiver<(u64, anyhow::Result<Vec<TasksEntry>>)>>,
+    task_body_rx: Option<std::sync::mpsc::Receiver<(u64, Result<String, String>)>>,
     task_body_entry: Option<TasksEntry>,
+    tasks_request_id: u64,
     /// Phase 2 — Settings overlay: the focused row index (0..=3). 0 = Sidebar,
     /// 1 = Status bar, 2 = Default agent, 3 = Theme. Drives the ▶ cursor in
     /// [`InputMode::Settings`].
@@ -466,6 +467,7 @@ impl App {
             tasks_fetch_rx: None,
             task_body_rx: None,
             task_body_entry: None,
+            tasks_request_id: 0,
             settings_cursor: 0,
         })
     }
@@ -699,10 +701,13 @@ impl<B: Backend> App<B> {
         let Some(rx) = self.tasks_fetch_rx.as_ref() else {
             return false;
         };
-        let Ok(result) = rx.try_recv() else {
+        let Ok((request_id, result)) = rx.try_recv() else {
             return false;
         };
         self.tasks_fetch_rx = None;
+        if request_id != self.tasks_request_id || self.mode != InputMode::TasksList {
+            return true;
+        }
         match result {
             Ok(items) => {
                 self.tasks_items = items;
@@ -723,10 +728,14 @@ impl<B: Backend> App<B> {
         let Some(rx) = self.task_body_rx.as_ref() else {
             return false;
         };
-        let Ok(result) = rx.try_recv() else {
+        let Ok((request_id, result)) = rx.try_recv() else {
             return false;
         };
         self.task_body_rx = None;
+        if request_id != self.tasks_request_id || self.mode != InputMode::TasksList {
+            self.task_body_entry = None;
+            return true;
+        }
         let Some(entry) = self.task_body_entry.take() else {
             return true;
         };
@@ -2640,7 +2649,9 @@ impl<B: Backend> App<B> {
     fn handle_jump_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc => self.mode = InputMode::Normal,
+            KeyCode::Esc => {
+                self.mode = InputMode::Normal;
+            }
             KeyCode::Enter => {
                 // Focus the selected filtered agent (if any) and close.
                 if let Some(&idx) = self.jump_filtered().get(self.jump_selected) {
@@ -2690,7 +2701,13 @@ impl<B: Backend> App<B> {
     fn handle_tasks_repo_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc => self.mode = InputMode::Normal,
+            KeyCode::Esc => {
+                self.tasks_fetch_rx = None;
+                self.task_body_rx = None;
+                self.task_body_entry = None;
+                self.tasks_request_id = self.tasks_request_id.wrapping_add(1);
+                self.mode = InputMode::Normal;
+            }
             KeyCode::Backspace => {
                 self.tasks_repo_input.pop();
             }
@@ -2700,6 +2717,8 @@ impl<B: Backend> App<B> {
                 match RepoRef::parse(&self.tasks_repo_input) {
                     Ok(repo) => {
                         self.tasks_repo = Some(repo.clone());
+                        self.tasks_request_id = self.tasks_request_id.wrapping_add(1);
+                        let request_id = self.tasks_request_id;
                         let (tx, rx) = std::sync::mpsc::channel();
                         self.tasks_fetch_rx = Some(rx);
                         self.tasks_items.clear();
@@ -2710,7 +2729,7 @@ impl<B: Backend> App<B> {
                             .name("orca-gh-tasks".into())
                             .spawn(move || {
                                 let result = Self::fetch_tasks_blocking(&repo);
-                                let _ = tx.send(result);
+                                let _ = tx.send((request_id, result));
                             })
                             .ok();
                     }
@@ -2777,6 +2796,10 @@ impl<B: Backend> App<B> {
     fn handle_tasks_list_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
+                self.tasks_fetch_rx = None;
+                self.task_body_rx = None;
+                self.task_body_entry = None;
+                self.tasks_request_id = self.tasks_request_id.wrapping_add(1);
                 self.tasks_error = None;
                 self.mode = InputMode::Normal;
             }
@@ -2811,6 +2834,8 @@ impl<B: Backend> App<B> {
                     TaskKind::PullRequest => entry.prompt.clone(),
                     TaskKind::Issue => {
                         if let Some(repo) = self.tasks_repo.clone() {
+                            self.tasks_request_id = self.tasks_request_id.wrapping_add(1);
+                            let request_id = self.tasks_request_id;
                             let (tx, rx) = std::sync::mpsc::channel();
                             self.task_body_rx = Some(rx);
                             self.task_body_entry = Some(entry.clone());
@@ -2824,7 +2849,7 @@ impl<B: Backend> App<B> {
                                                 crate::integrations::issue_to_prompt(&issue)
                                             })
                                             .map_err(|error| format!("{error:#}"));
-                                    let _ = tx.send(result);
+                                    let _ = tx.send((request_id, result));
                                 })
                                 .ok();
                             return;
@@ -3512,6 +3537,7 @@ mod tests {
                 tasks_fetch_rx: None,
                 task_body_rx: None,
                 task_body_entry: None,
+                tasks_request_id: 0,
                 settings_cursor: 0,
             }
         }
