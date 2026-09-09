@@ -7,12 +7,15 @@ use crate::agent::{status_tally, AgentStatus};
 use crate::input::InputMode;
 use crate::pane_slot::PaneSlot;
 use crate::sidebar::SidebarEntry;
+use ratatui::layout::Rect;
 
 /// 一帧 TUI 所需的只读派生数据。
 #[derive(Debug, Clone)]
 pub(crate) struct RenderModel {
     pub(crate) sidebar_entries: Vec<SidebarEntry>,
     pub(crate) tally: crate::agent::StatusTally,
+    pub(crate) pane_rects: Vec<Rect>,
+    pub(crate) footer_hint: String,
     pub(crate) overlay: OverlayModel,
 }
 
@@ -70,6 +73,8 @@ impl RenderModel {
         Self {
             sidebar_entries,
             tally,
+            pane_rects: Vec::new(),
+            footer_hint: String::new(),
             overlay: OverlayModel::default(),
         }
     }

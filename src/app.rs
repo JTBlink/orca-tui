@@ -1646,7 +1646,25 @@ impl<B: Backend> App<B> {
         // Derive an immutable render model before borrowing panes mutably for
         // viewport reconciliation and drawing.
         let mut render_model = RenderModel::from_slots(&self.panes, self.focus);
-        let sidebar_entries = render_model.sidebar_entries.clone();
+        render_model.pane_rects = rects.clone();
+        render_model.footer_hint = if zoomed {
+            FOOTER_ZOOM.to_string()
+        } else {
+            match self.mode {
+                InputMode::Pane => FOOTER_PANE,
+                InputMode::Jump => FOOTER_JUMP,
+                InputMode::Spawn => FOOTER_SPAWN,
+                InputMode::SpawnCustom => FOOTER_SPAWN_CUSTOM,
+                InputMode::TasksRepo => FOOTER_TASKS_REPO,
+                InputMode::TasksList => FOOTER_TASKS_LIST,
+                InputMode::Settings => FOOTER_SETTINGS,
+                InputMode::Activity => FOOTER_ACTIVITY,
+                InputMode::Dashboard => FOOTER_DASHBOARD,
+                InputMode::Sidebar => FOOTER_SIDEBAR,
+                InputMode::Normal => FOOTER_NORMAL,
+            }
+            .to_string()
+        };
 
         let focus = self.focus;
         let zoomed_render = zoomed;
@@ -1796,7 +1814,7 @@ impl<B: Backend> App<B> {
                     ConnectionState::Connected => Some(("● Daemon", theme.success())),
                     ConnectionState::Disconnected { .. } => Some(("✗ Disconnected", theme.error())),
                 };
-                sidebar::render_sidebar(f, sb, &sidebar_entries, theme, conn_status);
+                sidebar::render_sidebar(f, sb, &render_model.sidebar_entries, theme, conn_status);
                 // Fill the gap between sidebar and panes with the theme bg so it
                 // isn't a terminal-default strip (background everywhere).
                 let gw = content_area.x.saturating_sub(sb.right());
@@ -1863,25 +1881,8 @@ impl<B: Backend> App<B> {
                     Paragraph::new(status_line).style(Style::default().bg(theme.panel())),
                     foot[0],
                 );
-                let hint = if zoomed_render {
-                    FOOTER_ZOOM
-                } else {
-                    match mode {
-                        InputMode::Pane => FOOTER_PANE,
-                        InputMode::Jump => FOOTER_JUMP,
-                        InputMode::Spawn => FOOTER_SPAWN,
-                        InputMode::SpawnCustom => FOOTER_SPAWN_CUSTOM,
-                        InputMode::TasksRepo => FOOTER_TASKS_REPO,
-                        InputMode::TasksList => FOOTER_TASKS_LIST,
-                        InputMode::Settings => FOOTER_SETTINGS,
-                        InputMode::Activity => FOOTER_ACTIVITY,
-                        InputMode::Dashboard => FOOTER_DASHBOARD,
-                        InputMode::Sidebar => FOOTER_SIDEBAR,
-                        InputMode::Normal => FOOTER_NORMAL,
-                    }
-                };
                 f.render_widget(
-                    Paragraph::new(hint)
+                    Paragraph::new(render_model.footer_hint.as_str())
                         .style(Style::default().bg(theme.panel()).fg(theme.accent()))
                         .alignment(Alignment::Right),
                     foot[1],
