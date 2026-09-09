@@ -22,6 +22,46 @@ pub(crate) enum InputMode {
     Settings,
 }
 
+/// 键盘、鼠标和 modal 共享的瞬态 UI 状态集合。
+#[derive(Debug)]
+pub struct InteractionState {
+    pub(crate) mode: InputMode,
+    pub(crate) sidebar_hidden: bool,
+    pub(crate) jump_query: String,
+    pub(crate) jump_selected: usize,
+    pub(crate) spawn_selected: usize,
+    pub(crate) custom_cmd: String,
+    pub(crate) zoomed: bool,
+    pub(crate) show_help: bool,
+    pub(crate) sidebar_nav: usize,
+    pub(crate) drag_origin: Option<(usize, u16, u16)>,
+    pub(crate) tasks_repo_input: String,
+    pub(crate) tasks_selected: usize,
+    pub(crate) tasks_error: Option<String>,
+    pub(crate) settings_cursor: usize,
+}
+
+impl Default for InteractionState {
+    fn default() -> Self {
+        Self {
+            mode: InputMode::Normal,
+            sidebar_hidden: false,
+            jump_query: String::new(),
+            jump_selected: 0,
+            spawn_selected: 0,
+            custom_cmd: String::new(),
+            zoomed: false,
+            show_help: false,
+            sidebar_nav: 0,
+            drag_origin: None,
+            tasks_repo_input: String::new(),
+            tasks_selected: 0,
+            tasks_error: None,
+            settings_cursor: 0,
+        }
+    }
+}
+
 /// Pane 网格中的方向性焦点移动。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FocusDirection {

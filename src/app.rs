@@ -44,7 +44,7 @@ use crate::bus::{self, AgentUpdate, AgentUpdateReceiver, AgentUpdateSender};
 use crate::config::{Config, LayoutConfig};
 use crate::coordinator::Coordinator;
 use crate::daemon_connection::DaemonConnection;
-use crate::input::{self, FocusDirection as FocusDir, InputCommand, InputMode};
+use crate::input::{self, FocusDirection as FocusDir, InputCommand, InputMode, InteractionState};
 use crate::integrations::RepoRef;
 use crate::layout::split_panes;
 use crate::mobile::AgentSnapshot;
@@ -171,6 +171,7 @@ enum TaskKind {
 /// default `B = CrosstermBackend<Stdout>` is the real backend used by `run`.
 pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     panes: Vec<PaneSlot>,
+    interaction: InteractionState,
     focus: usize,
     terminal: Terminal<B>,
     bus_rx: AgentUpdateReceiver,
@@ -225,32 +226,12 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     bus_tx: AgentUpdateSender,
     /// User configuration (theme, layout, default agent).
     config: Config,
-    /// Current input mode (Normal = passthrough, Pane = focus navigation).
-    mode: InputMode,
-    /// User override for sidebar visibility (Ctrl+B toggles). `false` = let the
-    /// adaptive auto-hide logic decide; `true` = force-hidden regardless of width.
-    sidebar_hidden: bool,
-    /// Jump-palette (mode = Jump) state: the current filter query.
-    jump_query: String,
-    /// Jump-palette: selected index into the filtered agent list.
-    jump_selected: usize,
-    /// Spawn-picker: selected index into the agent options list.
-    spawn_selected: usize,
-    /// Custom-command modal (`InputMode::SpawnCustom`): the in-progress
-    /// command string the user is typing. Shell-split on Enter.
-    custom_cmd: String,
-    /// When true, the focused pane fills the entire content area (other panes
-    /// keep running, just not visible). Toggled with `z` in Pane mode.
-    zoomed: bool,
     /// A human-readable reason set just before [`App::main_loop`] breaks on
     /// auto-exit, so [`App::run`] can print it AFTER restoring the terminal
     /// (printing during raw mode corrupts the display). `None` for an explicit
     /// Ctrl+Q quit or a still-running loop. This is what tells the user WHY
     /// orcatui closed (e.g. "all agents exited") instead of vanishing silently.
     exit_reason: Option<&'static str>,
-    /// When true, a full-screen help overlay is rendered. Toggled with `?` in
-    /// Pane mode (or `F1`). Any key dismisses it.
-    show_help: bool,
     /// Daemon connection state — drives the sidebar indicator + error handling.
     conn_state: ConnectionState,
     /// Transient UI messages (daemon errors, connection changes, etc.).
@@ -260,9 +241,6 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// In-memory activity timeline (state transitions + errors). Rendered as a
     /// full-screen overlay via `InputMode::Activity`.
     activity: ActivityLog,
-    /// Sidebar nav menu selected index (0 = Activity, 1 = Tasks, 2 = Settings).
-    /// See [`SIDEBAR_NAV_ITEMS`]. Drives `InputMode::Sidebar` dispatch.
-    sidebar_nav: usize,
     /// Last-rendered OUTER pane rects (one per pane, in `panes` order), cached
     /// by [`App::render`] for mouse hit-testing in [`App::handle_mouse`].
     /// Empty until the first frame is drawn.
@@ -278,35 +256,31 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// even after `close_focused_pane` shifts vec positions. Resolved back to a
     /// position via [`App::idx_of_pane`] in `apply_update`.
     next_pane_id: usize,
-    /// The pane index + inner `(col, row)` where the left button went DOWN,
-    /// so a drag-selection only materializes on actual movement (a plain click
-    /// just focuses — no selection, no copy). Cleared on button-up. `None`
-    /// whenever no left-drag is in progress.
-    drag_origin: Option<(usize, u16, u16)>,
-    /// Phase 2 — Tasks view: the in-progress `owner/name` repo string the user
-    /// is typing in [`InputMode::TasksRepo`].
-    tasks_repo_input: String,
     /// Phase 2 — Tasks view: the parsed repo once submitted (set on Enter in
     /// [`InputMode::TasksRepo`], consumed for lazy body-fetch on dispatch).
     tasks_repo: Option<RepoRef>,
     /// Phase 2 — Tasks view: the fetched issues + PRs being browsed in
     /// [`InputMode::TasksList`]. Empty until a successful fetch.
     tasks_items: Vec<TasksEntry>,
-    /// Phase 2 — Tasks view: selected index into `tasks_items`.
-    tasks_selected: usize,
-    /// Phase 2 — Tasks view: a fetch error (bad repo, gh failure, no network).
-    /// When `Some`, the [`InputMode::TasksList`] overlay shows the error
-    /// message + "press Esc" instead of the item list.
-    tasks_error: Option<String>,
     /// GitHub task-list fetch running off the UI thread.
     tasks_fetch_rx: Option<std::sync::mpsc::Receiver<(u64, anyhow::Result<Vec<TasksEntry>>)>>,
     task_body_rx: Option<std::sync::mpsc::Receiver<(u64, Result<String, String>)>>,
     task_body_entry: Option<TasksEntry>,
     tasks_request_id: u64,
-    /// Phase 2 — Settings overlay: the focused row index (0..=3). 0 = Sidebar,
-    /// 1 = Status bar, 2 = Default agent, 3 = Theme. Drives the ▶ cursor in
-    /// [`InputMode::Settings`].
-    settings_cursor: usize,
+}
+
+impl<B: Backend> std::ops::Deref for App<B> {
+    type Target = InteractionState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.interaction
+    }
+}
+
+impl<B: Backend> std::ops::DerefMut for App<B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.interaction
+    }
 }
 
 impl App {
@@ -454,34 +428,21 @@ impl App {
             rows,
             bus_tx,
             config: Config::load_or_default(),
-            mode: InputMode::Normal,
-            sidebar_hidden: false,
-            jump_query: String::new(),
-            jump_selected: 0,
-            spawn_selected: 0,
-            custom_cmd: String::new(),
-            zoomed: false,
+            interaction: InteractionState::default(),
             exit_reason: None,
-            show_help: false,
             conn_state: ConnectionState::Standalone,
             toasts: crate::toast::ToastQueue::new(),
             daemon: None,
             activity: ActivityLog::new(),
-            sidebar_nav: 0,
             pane_rects: Vec::new(),
-            drag_origin: None,
             launch_cwd,
             next_pane_id: next_id,
-            tasks_repo_input: String::new(),
             tasks_repo: None,
             tasks_items: Vec::new(),
-            tasks_selected: 0,
-            tasks_error: None,
             tasks_fetch_rx: None,
             task_body_rx: None,
             task_body_entry: None,
             tasks_request_id: 0,
-            settings_cursor: 0,
         })
     }
 }
@@ -3566,34 +3527,21 @@ mod tests {
                 rows: 24,
                 bus_tx,
                 config: Config::default(),
-                mode: InputMode::Normal,
-                sidebar_hidden: false,
-                jump_query: String::new(),
-                jump_selected: 0,
-                spawn_selected: 0,
-                custom_cmd: String::new(),
-                zoomed: false,
+                interaction: InteractionState::default(),
                 exit_reason: None,
-                show_help: false,
                 conn_state: ConnectionState::Standalone,
                 toasts: crate::toast::ToastQueue::new(),
                 daemon: None,
                 activity: ActivityLog::new(),
-                sidebar_nav: 0,
                 pane_rects: Vec::new(),
-                drag_origin: None,
                 launch_cwd: std::env::current_dir().unwrap_or_default(),
                 next_pane_id: 0,
-                tasks_repo_input: String::new(),
                 tasks_repo: None,
                 tasks_items: Vec::new(),
-                tasks_selected: 0,
-                tasks_error: None,
                 tasks_fetch_rx: None,
                 task_body_rx: None,
                 task_body_entry: None,
                 tasks_request_id: 0,
-                settings_cursor: 0,
             }
         }
     }
