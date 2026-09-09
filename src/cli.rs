@@ -182,30 +182,35 @@ enum Command {
 }
 
 fn try_main(cli: Cli) -> Result<()> {
-    let command = cli.command.unwrap_or_else(|| {
-        // Smart default: if a daemon socket exists → attach; else → run default agent.
-        let socket = crate::daemon_server::default_socket_path();
-        if socket.exists() {
-            Command::Attach { socket: None }
-        } else {
-            // Detect an installed agent, fall back to "claude".
-            let agent = crate::agent::AgentKind::detect_installed()
-                .first()
-                .map(crate::agent::AgentKind::binary)
-                .unwrap_or("bash")
-                .to_string();
-            Command::Run {
-                cwd: None,
-                worktree: false,
-                daemon: false,
-                remote: None,
-                reconnect: false,
-                mobile: None,
-                command: vec![agent],
-            }
-        }
-    });
+    dispatch_command(cli.command.unwrap_or_else(default_command))
+}
 
+/// Resolve the no-subcommand convenience behavior without mixing it into
+/// subcommand dispatch.
+fn default_command() -> Command {
+    let socket = crate::daemon_server::default_socket_path();
+    if socket.exists() {
+        Command::Attach { socket: None }
+    } else {
+        let agent = crate::agent::AgentKind::detect_installed()
+            .first()
+            .map(crate::agent::AgentKind::binary)
+            .unwrap_or("bash")
+            .to_string();
+        Command::Run {
+            cwd: None,
+            worktree: false,
+            daemon: false,
+            remote: None,
+            reconnect: false,
+            mobile: None,
+            command: vec![agent],
+        }
+    }
+}
+
+/// Top-level dispatch: select exactly one command-specific startup path.
+fn dispatch_command(command: Command) -> Result<()> {
     match command {
         Command::Run {
             cwd,
