@@ -7,6 +7,8 @@
 - `PaneSlot` 是唯一的 per-pane 状态集合，包含 PTY、启动命令、task、daemon session、重连、pin
   和派生状态。
 - `input` 提供 `InputMode`、方向焦点和无副作用的 `InputCommand` reducer；App 负责执行命令。
+- `input::InteractionState` 统一持有 mode、modal 光标/文本、zoom、sidebar 与鼠标拖拽状态；
+  `App` 不再维护这些 transient state 的平行字段。
 - `render_model::RenderModel` 从 slot 派生 sidebar 与状态 tally，并携带一次性的
   `OverlayModel` 快照（Jump、Spawn、Tasks、Settings、Activity、Dashboard 等 modal 的只读视图数据）。
 - `daemon_connection::DaemonConnection` 封装 daemon RPC/stream，并提供专用 writer 线程。

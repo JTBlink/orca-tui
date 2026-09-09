@@ -106,9 +106,9 @@ pin 和活动状态。Vec position 只承担布局与焦点索引；异步输出
 reconnect、pin 或 status 的 parallel vectors。新增字段必须先归入 `PaneSlot`，Vec position
 只能作为布局和焦点索引。
 
-输入边界由 `input` 模块维护 `InputMode`、`FocusDirection` 和无副作用的
-`InputCommand` reducer。`App` 只执行语义命令；modal 文本状态仍在 App 中暂存，但不应在
-handler 内直接进行阻塞 I/O。
+输入边界由 `input` 模块维护 `InputMode`、`FocusDirection`、`InteractionState` 和无副作用的
+`InputCommand` reducer。`App` 通过 `Deref` 暴露该聚合状态，仍只执行语义命令；PTY、daemon
+与 GitHub 请求不属于交互状态，handler 不直接执行阻塞 I/O。
 
 渲染边界由 `render_model::RenderModel` 负责从 slot 派生 sidebar entries、状态 tally，并生成
 一次性的 `OverlayModel`（Jump、Spawn、Tasks、Settings、Activity、Dashboard 等 modal 的只读
