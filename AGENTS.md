@@ -9,7 +9,7 @@
 - `src/main.rs` 是 `orcatui` 入口；`src/bin/inject.rs` 构建 `orcatui-inject` 排查工具。
 - 单元测试与实现代码放在同一文件中，位于 `src/**/*.rs` 的 `#[cfg(test)]` 模块内。
 - `docs/TECHNICAL-DESIGN.md` 记录架构和协议边界。
-- `.codex/skills/` 存放仓库级 contributor skill；其中不得包含凭据、个人路径或其他敏感信息。
+- `.agents/skills/` 存放仓库级 contributor skill；其中不得包含凭据、个人路径或其他敏感信息。
 
 ## 构建、测试与开发命令
 

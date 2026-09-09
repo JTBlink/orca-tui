@@ -15,7 +15,7 @@
 在项目根目录运行：
 
 ```bash
-.codex/skills/orca-repo-viewer/scripts/ensure-orca.sh
+.agents/skills/orca-repo-viewer/scripts/ensure-orca.sh
 git -C ../orca rev-parse HEAD
 node -p "require('../orca/package.json').version"
 ```

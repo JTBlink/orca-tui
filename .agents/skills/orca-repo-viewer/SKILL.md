@@ -15,7 +15,7 @@ metadata:
 默认位置是当前项目的同级目录 `../orca`。使用附带脚本准备仓库：
 
 ```bash
-.codex/skills/orca-repo-viewer/scripts/ensure-orca.sh
+.agents/skills/orca-repo-viewer/scripts/ensure-orca.sh
 ```
 
 脚本行为：
@@ -46,7 +46,7 @@ metadata:
 
 ```bash
 # 建立路径并查看版本
-.codex/skills/orca-repo-viewer/scripts/ensure-orca.sh
+.agents/skills/orca-repo-viewer/scripts/ensure-orca.sh
 git -C ../orca log -1 --oneline
 node -p "require('../orca/package.json').version"
 
