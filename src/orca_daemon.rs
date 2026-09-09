@@ -685,7 +685,10 @@ mod tests {
         assert!(json.contains("\"version\":36"));
         assert!(json.contains("\"role\":\"control\""));
         assert!(json.contains("\"token\":\"tok-123\""));
-        assert!(json.contains("\"clientId\":\"cli-456\""), "field must serialize as camelCase clientId");
+        assert!(
+            json.contains("\"clientId\":\"cli-456\""),
+            "field must serialize as camelCase clientId"
+        );
     }
 
     #[test]
@@ -779,7 +782,9 @@ mod tests {
         let json = r#"{"type":"hello","ok":true,"error":null,"daemonIdentity":{"pid":42,"startedAtMs":99.0,"launchNonce":"xyz"},"retryable":null}"#;
         let resp: HelloResponse = serde_json::from_str(json).unwrap();
         assert!(resp.ok);
-        let id = resp.daemon_identity.expect("camelCase daemonIdentity accepted");
+        let id = resp
+            .daemon_identity
+            .expect("camelCase daemonIdentity accepted");
         assert_eq!(id.pid, 42);
         assert_eq!(id.launch_nonce, "xyz");
     }
