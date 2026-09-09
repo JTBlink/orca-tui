@@ -1891,24 +1891,12 @@ impl<B: Backend> App<B> {
             if jump_open {
                 use ratatui::style::Modifier;
                 use ratatui::text::Span;
-                use ratatui::widgets::{Block, BorderType, Borders, Clear};
                 let n = render_model.overlay.jump_filtered.len();
                 let pop_h = (n as u16 + 3).min(total.height.saturating_sub(4)).max(5);
                 let pop_w = total.width.min(64).max(40);
-                let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
-                let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
-                let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
-                f.render_widget(Clear, pop);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .style(Style::default().bg(theme.panel()))
-                    .border_style(Style::default().fg(theme.accent()))
-                    .title(
-                        Line::from(" Jump to agent ").style(Style::default().fg(theme.accent())),
-                    );
-                f.render_widget(&block, pop);
-                let inner = block.inner(pop);
+                let pop = crate::overlay::centered_rect(total, pop_w, pop_h);
+                let inner =
+                    crate::overlay::begin_popup(f, pop, Line::from(" Jump to agent "), theme);
 
                 let mut lines: Vec<Line> = Vec::new();
                 // Query line with a block cursor.
@@ -1949,7 +1937,6 @@ impl<B: Backend> App<B> {
             // Spawn picker overlay (drawn on top, like the jump palette).
             if spawn_open {
                 use ratatui::style::Modifier;
-                use ratatui::widgets::{Block, BorderType, Borders, Clear};
                 // ~3 items per 12 rows of terminal height, clamped to [2, 6]
                 let max_visible = ((total.height / 12) as usize).clamp(2, 6);
                 let n = render_model.overlay.spawn_options.len();
@@ -1958,18 +1945,8 @@ impl<B: Backend> App<B> {
                     .min(total.height.saturating_sub(4))
                     .max(5);
                 let pop_w = total.width.min(48).max(30);
-                let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
-                let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
-                let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
-                f.render_widget(Clear, pop);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .style(Style::default().bg(theme.panel()))
-                    .border_style(Style::default().fg(theme.accent()))
-                    .title(Line::from(" New pane ").style(Style::default().fg(theme.accent())));
-                f.render_widget(&block, pop);
-                let inner = block.inner(pop);
+                let pop = crate::overlay::centered_rect(total, pop_w, pop_h);
+                let inner = crate::overlay::begin_popup(f, pop, Line::from(" New pane "), theme);
 
                 // Scroll offset: keep the selected item visible.
                 let scroll = render_model

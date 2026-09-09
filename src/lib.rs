@@ -28,6 +28,7 @@ pub mod layout;
 pub mod mobile;
 pub mod orca_daemon;
 pub mod osc;
+pub(crate) mod overlay;
 pub mod pane;
 pub(crate) mod pane_slot;
 pub mod perf_probe;
