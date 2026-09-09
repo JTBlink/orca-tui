@@ -26,7 +26,23 @@ pub(crate) struct PaneSlot {
     pub(crate) last_status: Option<AgentStatus>,
 }
 
+impl std::ops::Deref for PaneSlot {
+    type Target = Pane;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pane
+    }
+}
+
+impl std::ops::DerefMut for PaneSlot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.pane
+    }
+}
+
 impl PaneSlot {
+    /// 创建一个拥有独立生命周期状态的 pane 槽位。
+    #[must_use]
     pub(crate) fn new(pane: Pane, command: Vec<String>) -> Self {
         Self {
             pane,
@@ -47,9 +63,9 @@ impl std::fmt::Debug for PaneSlot {
         f.debug_struct("PaneSlot")
             .field("pane", &self.pane)
             .field("has_session", &self.session.is_some())
-            .field("command", &self.command)
-            .field("task", &self.task)
-            .field("daemon_session_id", &self.daemon_session_id)
+            .field("command_len", &self.command.len())
+            .field("has_task", &self.task.is_some())
+            .field("has_daemon_session", &self.daemon_session_id.is_some())
             .field("reconnect", &self.reconnect.is_some())
             .field("reconnect_due", &self.reconnect_due)
             .field("pinned", &self.pinned)

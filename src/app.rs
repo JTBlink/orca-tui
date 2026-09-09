@@ -47,6 +47,7 @@ use crate::integrations::RepoRef;
 use crate::layout::split_panes;
 use crate::mobile::AgentSnapshot;
 use crate::pane::Pane;
+use crate::pane_slot::PaneSlot;
 use crate::pty_session::PtySession;
 use crate::scheduler::{FrameScheduler, TARGET_FRAME_60FPS};
 use crate::sidebar;
@@ -211,9 +212,7 @@ enum TaskKind {
 /// TTY required, runs identically on a dev machine and headless CI). The
 /// default `B = CrosstermBackend<Stdout>` is the real backend used by `run`.
 pub struct App<B: Backend = CrosstermBackend<Stdout>> {
-    panes: Vec<Pane>,
-    /// `None` once the session's child has exited and been reaped. Kept
-    /// parallel to `panes` (same index == same agent).
+    panes: Vec<PaneSlot>,
     sessions: Vec<Option<PtySession>>,
     focus: usize,
     terminal: Terminal<B>,
@@ -244,12 +243,6 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     coordinator: Option<Coordinator>,
     /// The agent binary used to run orchestrated tasks (e.g. `claude`).
     orch_agent: Option<String>,
-    /// `pane_task[i]` is the coordinator task id pane `i` is running (`None`
-    /// for non-orchestrated panes). Kept parallel to `panes`/`sessions`.
-    pane_task: Vec<Option<coordinator::TaskId>>,
-    /// Daemon session IDs parallel to panes — `None` for standalone panes or
-    /// panes that haven't been assigned a daemon session yet.
-    daemon_session_ids: Vec<Option<String>>,
     /// Shared session-ID → pane-index map for the daemon stream reader thread.
     /// `None` when not in daemon mode.
     daemon_session_map:
@@ -258,6 +251,8 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     daemon_reconnect_attempts: u32,
     /// Current backoff delay (doubles each failure, capped by config).
     daemon_backoff: Duration,
+    pane_task: Vec<Option<coordinator::TaskId>>,
+    daemon_session_ids: Vec<Option<String>>,
     /// PTY size captured at construction, reused by [`App::spawn_one`].
     cols: u16,
     rows: u16,
@@ -265,19 +260,12 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// bus mid-run. Completion is detected via [`App::all_sessions_gone`], not
     /// channel disconnect, so retaining this sender is safe.
     bus_tx: AgentUpdateSender,
-    /// The argv each pane was launched with (captured so a dropped remote
-    /// session can be re-spawned verbatim by Feature 8 reconnect).
     pane_command: Vec<Vec<String>>,
-    /// Feature 8: per-pane reconnect state. `Some` when the pane is eligible
-    /// for auto-reconnect (`--reconnect`); `None` otherwise.
     reconnect: Vec<Option<ssh::ReconnectSession>>,
-    /// Feature 8: when non-`None`, the pane is awaiting a backoff-scheduled
-    /// respawn at this `Instant`. Drained by [`App::pump_reconnect`].
     reconnect_due: Vec<Option<Instant>>,
-    /// Action item #6: per-pane pin flag, parallel to `panes` (`pinned[i]`
-    /// ↔ pane `i`). A pinned agent renders in a dedicated "PINNED" sidebar
-    /// section above "IN PROGRESS". Toggled in Pane mode with `p`.
+    /// Deprecated compatibility vectors; new code should use [`PaneSlot`].
     pinned: Vec<bool>,
+    last_status: Vec<Option<AgentStatus>>,
     /// User configuration (theme, layout, default agent).
     config: Config,
     /// Current input mode (Normal = passthrough, Pane = focus navigation).
@@ -315,9 +303,6 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// In-memory activity timeline (state transitions + errors). Rendered as a
     /// full-screen overlay via `InputMode::Activity`.
     activity: ActivityLog,
-    /// Per-pane previously-derived display status, parallel to `panes`. Used by
-    /// [`App::record_activity`] to detect transitions (only record on change).
-    last_status: Vec<Option<AgentStatus>>,
     /// Sidebar nav menu selected index (0 = Activity, 1 = Tasks, 2 = Settings).
     /// See [`SIDEBAR_NAV_ITEMS`]. Drives `InputMode::Sidebar` dispatch.
     sidebar_nav: usize,
@@ -424,9 +409,6 @@ impl App {
         let mut reconnect: Vec<Option<ssh::ReconnectSession>> = Vec::with_capacity(specs.len());
         let mut reconnect_due: Vec<Option<Instant>> = Vec::with_capacity(specs.len());
         let mut daemon_session_ids: Vec<Option<String>> = Vec::with_capacity(specs.len());
-        // Action item #6: one pin flag per spec, default unpinned. Captured
-        // before `specs.into_iter()` moves it.
-        let pinned: Vec<bool> = vec![false; specs.len()];
 
         // Monotonic pane-id allocator: each pane gets a globally-unique id
         // (never reused across close+spawn cycles), so the bus forwarder keeps
@@ -462,7 +444,8 @@ impl App {
                     if let Some(branch) = branch_label {
                         pane.set_branch(Some(branch));
                     }
-                    panes.push(pane);
+                    panes.push(PaneSlot::new(pane, command.clone()));
+                    sessions.push(Some(session));
                     // Pump this session's blocking receiver onto the async bus
                     // on a dedicated thread. The clone of `bus_tx` is the only
                     // sender this forwarder holds; when it returns, that clone
@@ -476,17 +459,15 @@ impl App {
                     let _ = thread::Builder::new()
                         .name(format!("orca-bus-fwd({name})"))
                         .spawn(move || bus::forward_session(id, rx, tx));
-                    sessions.push(Some(session));
                 }
                 Err(err) => {
                     eprintln!("orcatui: failed to spawn {name:?}: {err:#}");
                     let mut pane = Pane::new(id, &name, cols, rows);
                     pane.set_state(AgentState::Failed(format!("{err:#}")));
-                    panes.push(pane);
+                    panes.push(PaneSlot::new(pane, command.clone()));
                     sessions.push(None);
                 }
             }
-            // Plain `run` panes are not coordinated; reconnect is opt-in later.
             pane_task.push(None);
             pane_command.push(command);
             reconnect.push(None);
@@ -499,6 +480,7 @@ impl App {
 
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::new(backend).context("building ratatui terminal")?;
+        let pane_count = panes.len();
 
         Ok(Self {
             panes,
@@ -513,18 +495,19 @@ impl App {
             snapshot_tx: None,
             coordinator: None,
             orch_agent: None,
-            pane_task,
-            daemon_session_ids,
             daemon_session_map: None,
             daemon_reconnect_attempts: 0,
             daemon_backoff: Duration::from_secs(Config::default().daemon.reconnect_initial_secs),
+            pane_task,
+            daemon_session_ids,
             cols,
             rows,
             bus_tx,
             pane_command,
             reconnect,
             reconnect_due,
-            pinned,
+            pinned: vec![false; pane_count],
+            last_status: Vec::new(),
             config: Config::load_or_default(),
             mode: InputMode::Normal,
             sidebar_hidden: false,
@@ -539,7 +522,6 @@ impl App {
             toasts: crate::toast::ToastQueue::new(),
             daemon: None,
             activity: ActivityLog::new(),
-            last_status: Vec::new(),
             sidebar_nav: 0,
             pane_rects: Vec::new(),
             drag_origin: None,
@@ -793,10 +775,10 @@ impl<B: Backend> App<B> {
         // Keep the per-pane previous-status vec in lockstep with `panes` so a
         // mid-run `spawn_one` (which appends to `panes`) doesn't desync it.
         self.last_status.resize(self.panes.len(), None);
-        for (i, pane) in self.panes.iter().enumerate() {
-            let name = pane.name().to_string();
-            let new = AgentStatus::derive(pane.state(), pane.activity().map(|a| a.state.as_str()));
-            let prev = self.last_status[i];
+        for (i, slot) in self.panes.iter_mut().enumerate() {
+            let name = slot.name().to_string();
+            let new = AgentStatus::derive(slot.state(), slot.activity().map(|a| a.state.as_str()));
+            let prev = slot.last_status;
             if prev == Some(new) {
                 continue;
             }
@@ -812,7 +794,7 @@ impl<B: Backend> App<B> {
             }
             // An error event whenever an agent transitions INTO Failed.
             if matches!(new, AgentStatus::Failed) {
-                let message = match pane.state() {
+                let message = match slot.state() {
                     AgentState::Failed(m) => m.clone(),
                     _ => String::from("failed"),
                 };
@@ -822,6 +804,7 @@ impl<B: Backend> App<B> {
                     at: SystemTime::now(),
                 });
             }
+            slot.last_status = Some(new);
             self.last_status[i] = Some(new);
         }
     }
@@ -966,34 +949,41 @@ impl<B: Backend> App<B> {
                 // it terminal. (Reconnect is for `run --remote`, not orchestrate,
                 // so skipping report_done here is correct.)
                 let schedule_reconnect = self
-                    .reconnect
+                    .panes
                     .get(pane_id)
-                    .and_then(|o| o.as_ref())
-                    .is_some_and(|rs| !rs.exhausted());
+                    .and_then(|slot| slot.reconnect.as_ref())
+                    .is_some_and(|rs| !rs.exhausted())
+                    || self
+                        .reconnect
+                        .get(pane_id)
+                        .and_then(|slot| slot.as_ref())
+                        .is_some_and(|rs| !rs.exhausted());
                 if schedule_reconnect {
                     let now = Instant::now();
-                    if let Some(Some(rs)) = self.reconnect.get_mut(pane_id) {
-                        rs.record_failure(now);
-                        // Just-failed → full backoff for this attempt.
-                        let backoff = rs.next_retry_in(now).unwrap_or(Duration::ZERO);
-                        if let Some(d) = self.reconnect_due.get_mut(pane_id) {
-                            *d = Some(now + backoff);
+                    if let Some(slot) = self.panes.get_mut(pane_id) {
+                        if slot.reconnect.is_none() {
+                            slot.reconnect = self.reconnect.get(pane_id).cloned().flatten();
+                        }
+                        if let Some(rs) = slot.reconnect.as_mut() {
+                            rs.record_failure(now);
+                            // Just-failed → full backoff for this attempt.
+                            let backoff = rs.next_retry_in(now).unwrap_or(Duration::ZERO);
+                            slot.reconnect_due = Some(now + backoff);
+                            if let Some(due) = self.reconnect_due.get_mut(pane_id) {
+                                *due = slot.reconnect_due;
+                            }
                         }
                     }
+                    let attempt = self
+                        .panes.get(pane_id).and_then(|slot| slot.reconnect.as_ref())
+                        .map(|rs| rs.attempts())
+                        .unwrap_or(0);
                     if let Some(pane) = self.panes.get_mut(pane_id) {
-                        let attempt = self
-                            .reconnect
-                            .get(pane_id)
-                            .and_then(|o| o.as_ref())
-                            .map(|rs| rs.attempts())
-                            .unwrap_or(0);
                         pane.set_state(AgentState::Failed(format!(
                             "reconnecting (attempt {attempt})…"
                         )));
                     }
-                    if let Some(slot) = self.sessions.get_mut(pane_id) {
-                        slot.take();
-                    }
+                    if let Some(slot) = self.sessions.get_mut(pane_id) { slot.take(); }
                     return;
                 }
                 if let Some(pane) = self.panes.get_mut(pane_id) {
@@ -1021,13 +1011,11 @@ impl<B: Backend> App<B> {
                 // gone. `Option::take` is idempotent: a second Exit for the
                 // same pane (forwarder None after reap Some) finds the slot
                 // already None and is a no-op.
-                if let Some(slot) = self.sessions.get_mut(pane_id) {
-                    slot.take();
-                }
+                if let Some(slot) = self.sessions.get_mut(pane_id) { slot.take(); }
                 // Feature 7: if this pane ran an orchestrated task, report its
                 // completion to the coordinator so dependent tasks can be
                 // dispatched on the next pump.
-                if let Some(tid) = self.pane_task.get(pane_id).copied().flatten() {
+                if let Some(tid) = self.panes.get(pane_id).and_then(|slot| slot.task) {
                     let failed = self
                         .panes
                         .get(pane_id)
@@ -1096,7 +1084,9 @@ impl<B: Backend> App<B> {
                 if let Some(snap) = resp.get("snapshot").and_then(|v| v.as_str()) {
                     pane.feed(snap.as_bytes());
                 }
-                self.panes.push(pane);
+                let mut slot = PaneSlot::new(pane, command.clone());
+                slot.daemon_session_id = Some(session_id.clone());
+                self.panes.push(slot);
                 self.sessions.push(None); // no local PTY in daemon mode
                 self.daemon_session_ids.push(Some(session_id.clone()));
                 // Register the session id → stable pane id in the stream
@@ -1123,11 +1113,12 @@ impl<B: Backend> App<B> {
                 )));
                 let mut pane = Pane::new(id, &name, cols, rows);
                 pane.set_state(AgentState::Failed(reason));
-                self.panes.push(pane);
+                self.panes.push(PaneSlot::new(pane, command.clone()));
                 self.sessions.push(None);
                 self.daemon_session_ids.push(None);
             }
         }
+        self.panes.last_mut().expect("spawned pane").task = None;
         self.pane_task.push(None);
         self.pane_command.push(command);
         self.reconnect.push(None);
@@ -1153,7 +1144,7 @@ impl<B: Backend> App<B> {
             Ok((session, rx)) => {
                 let mut pane = Pane::new(id, &name, cols, rows);
                 pane.set_state(AgentState::Running);
-                self.panes.push(pane);
+                self.panes.push(PaneSlot::new(pane, command.clone()));
                 let tx = self.bus_tx.clone();
                 let _ = thread::Builder::new()
                     .name(format!("orca-bus-fwd({name})"))
@@ -1166,10 +1157,11 @@ impl<B: Backend> App<B> {
                 // below carries the error into the header + sidebar instead.
                 let mut pane = Pane::new(id, &name, cols, rows);
                 pane.set_state(AgentState::Failed(format!("{err:#}")));
-                self.panes.push(pane);
+                self.panes.push(PaneSlot::new(pane, command.clone()));
                 self.sessions.push(None);
             }
         }
+        self.panes.last_mut().expect("spawned pane").task = None;
         self.pane_task.push(None);
         self.pane_command.push(command);
         self.reconnect.push(None);
@@ -1207,10 +1199,12 @@ impl<B: Backend> App<B> {
                 // position shift when another pane closes.
                 let session_map: Arc<Mutex<HashMap<String, usize>>> =
                     Arc::new(Mutex::new(HashMap::new()));
-                for (i, sid) in self.daemon_session_ids.iter().enumerate() {
+                for (i, pane) in self.panes.iter().enumerate() {
+                    let sid = pane.daemon_session_id.as_ref().or_else(|| {
+                        self.daemon_session_ids.get(i).and_then(|s| s.as_ref())
+                    });
                     if let Some(sid) = sid {
-                        let pane_id = self.panes.get(i).map(|p| p.id()).unwrap_or(i);
-                        session_map.lock().unwrap().insert(sid.clone(), pane_id);
+                        session_map.lock().unwrap().insert(sid.clone(), pane.id());
                     }
                 }
 
@@ -1297,15 +1291,23 @@ impl<B: Backend> App<B> {
 
     pub fn enable_reconnect(&mut self) {
         let policy = ssh::ReconnectPolicy::default();
-        for slot in &mut self.reconnect {
-            *slot = Some(ssh::ReconnectSession::new(policy.clone()));
+        for (i, slot) in self.reconnect.iter_mut().enumerate() {
+            let state = ssh::ReconnectSession::new(policy.clone());
+            *slot = Some(state);
+            if let Some(pane) = self.panes.get_mut(i) {
+                pane.reconnect = Some(ssh::ReconnectSession::new(policy.clone()));
+            }
         }
     }
 
     /// Feature 8: re-spawn pane `i`'s command into the same pane (preserving
     /// its emulator/scrollback), used when a scheduled reconnect comes due.
     fn respawn(&mut self, i: usize) {
-        let Some(command) = self.pane_command.get(i).cloned() else {
+        let Some(command) = self
+            .panes
+            .get(i)
+            .and_then(|slot| (!slot.command.is_empty()).then(|| slot.command.clone()))
+            .or_else(|| self.pane_command.get(i).cloned()) else {
             return;
         };
         // The pane already has a stable id — re-use it for the new forwarder
@@ -1323,6 +1325,7 @@ impl<B: Backend> App<B> {
                 }
                 if let Some(pane) = self.panes.get_mut(i) {
                     pane.set_state(AgentState::Running);
+                    pane.reconnect_due = None;
                 }
                 let tx = self.bus_tx.clone();
                 let _ = thread::Builder::new()
@@ -1370,9 +1373,8 @@ impl<B: Backend> App<B> {
                     rs.record_success();
                 }
             }
-            if let Some(d) = self.reconnect_due.get_mut(i) {
-                d.take();
-            }
+            if let Some(d) = self.reconnect_due.get_mut(i) { d.take(); }
+            if let Some(slot) = self.panes.get_mut(i) { slot.reconnect_due = None; }
             self.respawn(i);
         }
     }
@@ -1539,6 +1541,9 @@ impl<B: Backend> App<B> {
             if let Some(slot) = self.pane_task.get_mut(pane_id) {
                 *slot = Some(tid);
             }
+            if let Some(slot) = self.panes.get_mut(pane_id) {
+                slot.task = Some(tid);
+            }
         }
     }
 
@@ -1658,7 +1663,7 @@ impl<B: Backend> App<B> {
                 branch: p.branch().map(String::from),
                 activity: p.activity().cloned(),
                 focused: i == self.focus,
-                pinned: self.pinned.get(i).copied().unwrap_or(false),
+                pinned: self.panes.get(i).map(|slot| slot.pinned).unwrap_or(false),
             })
             .collect();
 
@@ -3290,8 +3295,11 @@ impl<B: Backend> App<B> {
     }
 
     fn toggle_pin_focused(&mut self) {
-        if let Some(slot) = self.pinned.get_mut(self.focus) {
-            *slot = !*slot;
+        if let Some(slot) = self.panes.get_mut(self.focus) {
+            slot.pinned = !slot.pinned;
+            if let Some(mirror) = self.pinned.get_mut(self.focus) {
+                *mirror = slot.pinned;
+            }
         }
     }
 
@@ -3337,7 +3345,7 @@ impl<B: Backend> App<B> {
         if self.focus >= self.panes.len() {
             None
         } else {
-            self.panes.get_mut(self.focus)
+            self.panes.get_mut(self.focus).map(|slot| &mut slot.pane)
         }
     }
 
@@ -3353,9 +3361,10 @@ impl<B: Backend> App<B> {
         if let Some(daemon) = &mut self.daemon {
             // Daemon mode: forward via RPC using the pane's daemon session ID.
             let session_id = match self
-                .daemon_session_ids
+                .panes
                 .get(self.focus)
-                .and_then(|s| s.as_ref())
+                .and_then(|slot| slot.daemon_session_id.as_ref())
+                .or_else(|| self.daemon_session_ids.get(self.focus).and_then(|s| s.as_ref()))
             {
                 Some(id) => id.clone(),
                 None => return, // no daemon session for this pane yet
@@ -3498,6 +3507,10 @@ mod tests {
         /// Build an `App` from pre-made panes with no live sessions and no raw
         /// mode — purely for exercising the decision logic under test.
         fn for_test(panes: Vec<Pane>) -> Self {
+            let panes: Vec<PaneSlot> = panes
+                .into_iter()
+                .map(|pane| PaneSlot::new(pane, Vec::new()))
+                .collect();
             let n = panes.len();
             // Use an in-memory TestBackend (NOT CrosstermBackend+stdout) so the
             // tests run identically on a developer TTY and on a headless CI
@@ -3805,7 +3818,7 @@ mod tests {
 
         // A live session suppresses auto-exit regardless of mode.
         app.sessions.push(dummy_session());
-        app.panes.push(pane(0, "alive"));
+        app.panes.push(PaneSlot::new(pane(0, "alive"), Vec::new()));
         app.mode = InputMode::Normal;
         assert!(
             !app.should_auto_exit(),
