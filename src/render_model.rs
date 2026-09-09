@@ -4,6 +4,7 @@
 //! PTY、daemon 或终端句柄，使渲染准备步骤可以独立测试。
 
 use crate::agent::{status_tally, AgentStatus};
+use crate::input::InputMode;
 use crate::pane_slot::PaneSlot;
 use crate::sidebar::SidebarEntry;
 
@@ -12,6 +13,32 @@ use crate::sidebar::SidebarEntry;
 pub(crate) struct RenderModel {
     pub(crate) sidebar_entries: Vec<SidebarEntry>,
     pub(crate) tally: crate::agent::StatusTally,
+    pub(crate) overlay: OverlayModel,
+}
+
+/// Owned, read-only view data for modal overlays. Keeping this alongside the
+/// pane/sidebar model means the draw closure consumes one immutable snapshot
+/// instead of borrowing transient fields from `App` piecemeal.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OverlayModel {
+    pub(crate) mode: InputMode,
+    pub(crate) jump_query: String,
+    pub(crate) jump_filtered: Vec<(usize, String)>,
+    pub(crate) jump_selected: usize,
+    pub(crate) spawn_options: Vec<(String, String)>,
+    pub(crate) spawn_selected: usize,
+    pub(crate) activity_lines: Vec<String>,
+    pub(crate) sidebar_selected: usize,
+    pub(crate) tasks_repo_input: String,
+    pub(crate) tasks_items: Vec<(String, String)>,
+    pub(crate) tasks_selected: usize,
+    pub(crate) tasks_error: Option<String>,
+    pub(crate) settings_cursor: usize,
+    pub(crate) settings_sidebar_on: bool,
+    pub(crate) settings_status_bar: bool,
+    pub(crate) settings_default_agent: String,
+    pub(crate) settings_theme_name: String,
+    pub(crate) dashboard_entries: Vec<(String, AgentStatus)>,
 }
 
 impl RenderModel {
@@ -43,6 +70,7 @@ impl RenderModel {
         Self {
             sidebar_entries,
             tally,
+            overlay: OverlayModel::default(),
         }
     }
 }

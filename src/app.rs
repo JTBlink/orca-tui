@@ -205,6 +205,11 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     daemon_reconnect_attempts: u32,
     /// Current backoff delay (doubles each failure, capped by config).
     daemon_backoff: Duration,
+    daemon_reconnect_rx: Option<
+        std::sync::mpsc::Receiver<
+            Option<Result<DaemonConnection, crate::orca_daemon::DaemonError>>,
+        >,
+    >,
     /// PTY size captured at construction, reused by [`App::spawn_one`].
     cols: u16,
     rows: u16,
@@ -437,6 +442,7 @@ impl App {
             daemon_session_map: None,
             daemon_reconnect_attempts: 0,
             daemon_backoff: Duration::from_secs(Config::default().daemon.reconnect_initial_secs),
+            daemon_reconnect_rx: None,
             cols,
             rows,
             bus_tx,
@@ -1372,8 +1378,39 @@ impl<B: Backend> App<B> {
             return; // not yet time
         }
 
-        // Attempt reconnection.
-        match DaemonConnection::try_connect(crate::orca_daemon::DaemonConnectOptions::default()) {
+        // Start at most one bounded worker; the UI keeps polling while the
+        // socket handshake runs off-thread.
+        if self.daemon_reconnect_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.daemon_reconnect_rx = Some(rx);
+            let opts = crate::orca_daemon::DaemonConnectOptions {
+                rpc_timeout: Duration::from_secs(self.config.daemon.rpc_timeout_secs),
+                hello_timeout: Duration::from_secs(self.config.daemon.hello_timeout_secs),
+            };
+            let spawned = std::thread::Builder::new()
+                .name("orca-daemon-reconnect".into())
+                .spawn(move || {
+                    let result = DaemonConnection::try_connect(opts);
+                    let _ = tx.send(result);
+                })
+                .is_ok();
+            if !spawned {
+                self.daemon_reconnect_rx = None;
+                self.toasts.push(crate::toast::Toast::warning(
+                    "无法启动 daemon 重连 worker，将稍后重试。",
+                ));
+            }
+            return;
+        }
+        let Some(rx) = self.daemon_reconnect_rx.as_ref() else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        self.daemon_reconnect_rx = None;
+
+        match result {
             None => {
                 // Daemon disappeared entirely — give up, go standalone.
                 self.conn_state = ConnectionState::Standalone;
@@ -1623,7 +1660,7 @@ impl<B: Backend> App<B> {
 
         // Derive an immutable render model before borrowing panes mutably for
         // viewport reconciliation and drawing.
-        let render_model = RenderModel::from_slots(&self.panes, self.focus);
+        let mut render_model = RenderModel::from_slots(&self.panes, self.focus);
         let sidebar_entries = render_model.sidebar_entries.clone();
 
         let focus = self.focus;
@@ -1715,6 +1752,43 @@ impl<B: Backend> App<B> {
                 .collect()
         } else {
             Vec::new()
+        };
+        // Consolidate all modal-only values into the immutable render model.
+        // Overlay drawing below consumes this snapshot and never reaches back
+        // into `App` while panes are mutably borrowed.
+        render_model.overlay = crate::render_model::OverlayModel {
+            mode,
+            jump_query: jump_query.clone(),
+            jump_filtered: jump_filtered_idx
+                .iter()
+                .map(|&idx| {
+                    (
+                        idx,
+                        self.panes
+                            .get(idx)
+                            .map(|p| p.name().to_string())
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            jump_selected,
+            spawn_options: spawn_opts.clone(),
+            spawn_selected,
+            activity_lines: activity_lines.clone(),
+            sidebar_selected,
+            tasks_repo_input: tasks_repo_input_view.clone(),
+            tasks_items: tasks_items_view
+                .iter()
+                .map(|entry| (entry.title.clone(), entry.number.to_string()))
+                .collect(),
+            tasks_selected: tasks_selected_view,
+            tasks_error: tasks_error_view.clone(),
+            settings_cursor,
+            settings_sidebar_on,
+            settings_status_bar,
+            settings_default_agent: settings_default_agent.clone(),
+            settings_theme_name: settings_theme_name.clone(),
+            dashboard_entries: dashboard_entries.clone(),
         };
         let panes = &mut self.panes;
         let theme = &self.config.theme;
@@ -2457,71 +2531,7 @@ impl<B: Backend> App<B> {
                 return;
             }
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        // Ctrl+Alt+P gateway (Alt adds an ESC-prefix byte so it's distinct
-        // from Ctrl+P, which opencode uses for its command palette).
-        if ctrl && key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('p') {
-            self.mode = InputMode::Pane;
-            return;
-        }
-        // Ctrl+Q → quit (only other global hotkey; everything else lives
-        // behind the gateway in Pane mode to avoid colliding with agent
-        // shortcuts like opencode's Ctrl+P command palette).
-        if ctrl && key.code == KeyCode::Char('q') {
-            self.quit = true;
-            return;
-        }
         match self.mode {
-            InputMode::Normal => self.forward_key_to_agent(key),
-            InputMode::Pane => match key.code {
-                KeyCode::Esc => self.mode = InputMode::Normal,
-                KeyCode::Tab => self.focus_next(),
-                KeyCode::BackTab => self.focus_prev(),
-                KeyCode::Up | KeyCode::Char('k') => self.focus_directional(FocusDir::Up),
-                KeyCode::Down | KeyCode::Char('j') => self.focus_directional(FocusDir::Down),
-                KeyCode::Left | KeyCode::Char('h') => self.focus_directional(FocusDir::Left),
-                KeyCode::Right | KeyCode::Char('l') => self.focus_directional(FocusDir::Right),
-                // Action item #6: toggle the pin flag on the focused pane so it
-                // renders in the dedicated "PINNED" sidebar section. A bare `p`
-                // (no modifiers) — only Ctrl+Alt+P is intercepted above as the
-                // mode-enter gateway, so plain Ctrl+P is forwarded to the agent
-                // and a bare `p` reaches this arm.
-                KeyCode::Char('p') => self.toggle_pin_focused(),
-                // `x` kills the focused pane (closes the agent + removes it
-                // from the grid). Focus moves to the previous pane.
-                KeyCode::Char('x') => self.close_focused_pane(),
-                // `z` toggles zoom: the focused pane fills the content area.
-                KeyCode::Char('z') => self.zoomed = !self.zoomed,
-                // `?` toggles the help overlay.
-                KeyCode::Char('?') => self.show_help = !self.show_help,
-                // `/` opens the fuzzy-focus jump palette.
-                KeyCode::Char('/') => {
-                    self.jump_query.clear();
-                    self.jump_selected = 0;
-                    self.mode = InputMode::Jump;
-                }
-                // `a` opens the full-screen activity timeline overlay.
-                KeyCode::Char('a') => self.mode = InputMode::Activity,
-                // `d` opens the read-only 3-bucket agent dashboard overlay
-                // (Phase 2): groups live statuses into needs-attention /
-                // working / done columns. Any key dismisses it.
-                KeyCode::Char('d') => self.mode = InputMode::Dashboard,
-                // `n` opens the spawn picker (moved from global Ctrl+N to
-                // avoid colliding with agent shortcuts).
-                KeyCode::Char('n') => {
-                    self.spawn_selected = 0;
-                    self.mode = InputMode::Spawn;
-                }
-                // `b` toggles the sidebar visibility (moved from Ctrl+B).
-                KeyCode::Char('b') => self.sidebar_hidden = !self.sidebar_hidden,
-                // `s` opens the sidebar navigation hub (moved from Ctrl+S,
-                // which terminals may swallow as XOFF flow control).
-                KeyCode::Char('s') => {
-                    self.mode = InputMode::Sidebar;
-                    self.sidebar_nav = 0;
-                }
-                _ => {}
-            },
             InputMode::Jump => self.handle_jump_key(key),
             InputMode::Spawn => self.handle_spawn_key(key),
             // Activity overlay: any key dismisses it (back to Normal), mirroring
@@ -2609,6 +2619,8 @@ impl<B: Backend> App<B> {
             InputMode::TasksRepo => self.handle_tasks_repo_key(key),
             InputMode::TasksList => self.handle_tasks_list_key(key),
             InputMode::Settings => self.handle_settings_key(key),
+            // Normal and Pane modes are fully handled by `reduce_key` above.
+            InputMode::Normal | InputMode::Pane => {}
         }
     }
 
@@ -3507,6 +3519,7 @@ mod tests {
                 daemon_session_map: None,
                 daemon_reconnect_attempts: 0,
                 daemon_backoff: Duration::from_secs(3),
+                daemon_reconnect_rx: None,
                 cols: 80,
                 rows: 24,
                 bus_tx,
@@ -3934,12 +3947,16 @@ mod tests {
         let mut app = App::for_test(vec![pane(0, "a")]);
         let (tx, rx) = std::sync::mpsc::channel();
         app.tasks_fetch_rx = Some(rx);
-        tx.send(Ok(vec![TasksEntry {
-            kind: TaskKind::Issue,
-            number: 7,
-            title: "后台结果".into(),
-            prompt: "prompt".into(),
-        }]))
+        app.mode = InputMode::TasksList;
+        tx.send((
+            0,
+            Ok(vec![TasksEntry {
+                kind: TaskKind::Issue,
+                number: 7,
+                title: "后台结果".into(),
+                prompt: "prompt".into(),
+            }]),
+        ))
         .unwrap();
 
         assert!(app.poll_tasks_fetch());
