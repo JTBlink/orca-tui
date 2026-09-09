@@ -95,4 +95,11 @@ mod tests {
         assert!(slot.last_status.is_none());
         assert!(matches!(slot.pane.state(), AgentState::Idle));
     }
+
+    #[test]
+    fn slot_deref_preserves_stable_pane_identity() {
+        let slot = PaneSlot::new(Pane::new(42, "agent", 40, 8), vec!["agent".into()]);
+        assert_eq!(slot.id(), 42);
+        assert_eq!(slot.name(), "agent");
+    }
 }
