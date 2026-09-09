@@ -150,6 +150,9 @@ struct TasksEntry {
     prompt: String,
 }
 
+type DaemonSpawnReceiver =
+    std::sync::mpsc::Receiver<Result<serde_json::Value, crate::orca_daemon::DaemonError>>;
+
 /// Which kind of GitHub item a [`TasksEntry`] represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskKind {
@@ -210,6 +213,9 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
             Option<Result<DaemonConnection, crate::orca_daemon::DaemonError>>,
         >,
     >,
+    /// In-flight createOrAttach RPC, completed by a worker and applied on the
+    /// next UI tick so dynamic pane creation never blocks input/rendering.
+    daemon_spawn_rx: Vec<(usize, String, DaemonSpawnReceiver)>,
     /// PTY size captured at construction, reused by [`App::spawn_one`].
     cols: u16,
     rows: u16,
@@ -443,6 +449,7 @@ impl App {
             daemon_reconnect_attempts: 0,
             daemon_backoff: Duration::from_secs(Config::default().daemon.reconnect_initial_secs),
             daemon_reconnect_rx: None,
+            daemon_spawn_rx: Vec::new(),
             cols,
             rows,
             bus_tx,
@@ -656,6 +663,7 @@ impl<B: Backend> App<B> {
             // Daemon reconnection: if we were connected and the daemon crashed,
             // attempt to reconnect on an exponential backoff.
             self.pump_daemon_reconnect();
+            self.pump_daemon_spawns();
 
             // Poll with the scheduler-chosen timeout: ~remaining-to-next-frame
             // when active, the longer idle interval when nothing is happening.
@@ -1044,10 +1052,10 @@ impl<B: Backend> App<B> {
         self.spawn_one_local(spec)
     }
 
-    /// Daemon-mode spawn: sends `createOrAttach` RPC, feeds the snapshot to the
-    /// pane emulator, and registers the session ID in the stream reader map.
+    /// Daemon-mode spawn: creates an Idle placeholder immediately, then sends
+    /// `createOrAttach` on a bounded worker connection. Completion is applied
+    /// by [`Self::pump_daemon_spawns`] without blocking the UI loop.
     fn spawn_one_daemon(&mut self, spec: AgentSpec) -> usize {
-        use crate::orca_daemon::DaemonError;
         let idx = self.panes.len();
         // Stable pane id (never reused). The daemon stream reader reports
         // `AgentUpdate`s by this id; `apply_update` resolves it back to a
@@ -1067,55 +1075,71 @@ impl<B: Backend> App<B> {
                 .as_millis()
         );
 
-        let daemon = self.daemon.as_mut().unwrap();
-        match daemon.rpc(
-            "createOrAttach",
-            serde_json::json!({
-                "sessionId": session_id,
-                "cols": cols,
-                "rows": rows,
-                "command": command.first().cloned().unwrap_or_default(),
-            }),
-        ) {
-            Ok(resp) => {
-                let mut pane = Pane::new(id, &name, cols, rows);
-                pane.set_state(AgentState::Running);
-                // Feed the snapshot (if any) to restore the terminal state.
-                if let Some(snap) = resp.get("snapshot").and_then(|v| v.as_str()) {
-                    pane.feed(snap.as_bytes());
-                }
-                let mut slot = PaneSlot::new(pane, command.clone());
-                slot.daemon_session_id = Some(session_id.clone());
-                self.panes.push(slot);
-                // Register the session id → stable pane id in the stream
-                // reader's map (NOT the position), so the reader's
-                // `AgentUpdate::Output { pane_id }` carries the stable id.
-                if let Some(map) = &self.daemon_session_map {
-                    map.lock().unwrap().insert(session_id, id);
-                }
-            }
-            Err(e) => {
-                let reason = match &e {
-                    DaemonError::Disconnected { reason } => {
-                        self.conn_state = ConnectionState::Disconnected {
-                            reason: reason.clone(),
-                            next_retry: Some(Instant::now() + Duration::from_secs(3)),
-                        };
-                        self.daemon = None;
-                        reason.clone()
-                    }
-                    _ => e.to_string(),
-                };
-                self.toasts.push(crate::toast::Toast::error(format!(
-                    "Failed to create daemon session: {reason}"
-                )));
-                let mut pane = Pane::new(id, &name, cols, rows);
-                pane.set_state(AgentState::Failed(reason));
-                self.panes.push(PaneSlot::new(pane, command.clone()));
-            }
-        }
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "cols": cols,
+            "rows": rows,
+            "command": command.first().cloned().unwrap_or_default(),
+        });
+        let pane = Pane::new(id, &name, cols, rows);
+        self.panes.push(PaneSlot::new(pane, command.clone()));
+        let rx = self
+            .daemon
+            .as_ref()
+            .expect("daemon mode checked by spawn_one")
+            .spawn_session_async(params);
+        self.daemon_spawn_rx.push((id, session_id, rx));
         self.panes.last_mut().expect("spawned pane").task = None;
         idx
+    }
+
+    /// Apply any finished daemon create-session workers. Pending receivers are
+    /// retained; completed or disconnected receivers are removed exactly once.
+    fn pump_daemon_spawns(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        let pending = std::mem::take(&mut self.daemon_spawn_rx);
+        let mut changed = false;
+        for (pane_id, session_id, rx) in pending {
+            match rx.try_recv() {
+                Ok(Ok(response)) => {
+                    if let Some(idx) = self.idx_of_pane(pane_id) {
+                        let slot = &mut self.panes[idx];
+                        slot.set_state(AgentState::Running);
+                        if let Some(snapshot) = response.get("snapshot").and_then(|v| v.as_str()) {
+                            slot.feed(snapshot.as_bytes());
+                        }
+                        slot.daemon_session_id = Some(session_id.clone());
+                        if let Some(map) = &self.daemon_session_map {
+                            map.lock().unwrap().insert(session_id, pane_id);
+                        }
+                    }
+                    changed = true;
+                }
+                Ok(Err(error)) => {
+                    let reason = error.to_string();
+                    if let Some(idx) = self.idx_of_pane(pane_id) {
+                        self.panes[idx].set_state(AgentState::Failed(reason.clone()));
+                    }
+                    self.toasts.push(crate::toast::Toast::error(format!(
+                        "Failed to create daemon session: {reason}"
+                    )));
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => {
+                    self.daemon_spawn_rx.push((pane_id, session_id, rx));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    let reason = "daemon session worker stopped before returning a result";
+                    if let Some(idx) = self.idx_of_pane(pane_id) {
+                        self.panes[idx].set_state(AgentState::Failed(reason.to_string()));
+                    }
+                    self.toasts.push(crate::toast::Toast::error(reason));
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// Standalone-mode spawn: creates a local PTY via portable-pty.
@@ -3406,6 +3430,7 @@ impl<B: Backend> App<B> {
     fn should_auto_exit(&self) -> bool {
         self.all_sessions_gone()
             && self.orchestration_drained()
+            && self.daemon_spawn_rx.is_empty()
             && self.panes.iter().all(|slot| slot.reconnect_due.is_none())
             && self.mode == InputMode::Normal
             && !self.zoomed
@@ -3520,6 +3545,7 @@ mod tests {
                 daemon_reconnect_attempts: 0,
                 daemon_backoff: Duration::from_secs(3),
                 daemon_reconnect_rx: None,
+                daemon_spawn_rx: Vec::new(),
                 cols: 80,
                 rows: 24,
                 bus_tx,

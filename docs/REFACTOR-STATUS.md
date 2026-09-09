@@ -7,9 +7,12 @@
 - `PaneSlot` 是唯一的 per-pane 状态集合，包含 PTY、启动命令、task、daemon session、重连、pin
   和派生状态。
 - `input` 提供 `InputMode`、方向焦点和无副作用的 `InputCommand` reducer；App 负责执行命令。
-- `render_model::RenderModel` 从 slot 派生 sidebar 与状态 tally。
+- `render_model::RenderModel` 从 slot 派生 sidebar 与状态 tally，并携带一次性的
+  `OverlayModel` 快照（Jump、Spawn、Tasks、Settings、Activity、Dashboard 等 modal 的只读视图数据）。
 - `daemon_connection::DaemonConnection` 封装 daemon RPC/stream，并提供专用 writer 线程。
 - GitHub Tasks 列表和 daemon 写入不再阻塞 UI loop。
+- daemon 动态 `createOrAttach` 通过独立 worker 完成，UI 先展示占位 pane，再以非阻塞轮询
+  应用成功快照或错误状态。
 
 ## 验证命令
 

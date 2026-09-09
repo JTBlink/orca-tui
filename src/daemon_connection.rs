@@ -82,6 +82,27 @@ impl DaemonConnection {
         }
     }
 
+    /// Start a daemon session without waiting for the control RPC on the UI
+    /// thread. The worker owns a short-lived control connection, so the main
+    /// connection remains available for stream/reconnect traffic.
+    pub(crate) fn spawn_session_async(
+        &self,
+        params: serde_json::Value,
+    ) -> mpsc::Receiver<Result<serde_json::Value, DaemonError>> {
+        let endpoint = self.client.endpoint().clone();
+        let options = self.options.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("orca-daemon-create-session".into())
+            .spawn(move || {
+                let result = DaemonClient::connect_with(endpoint, options)
+                    .and_then(|mut client| client.rpc("createOrAttach", params));
+                let _ = tx.send(result);
+            })
+            .ok();
+        rx
+    }
+
     /// 取出 stream socket，交给后台 reader 线程。
     pub(crate) fn take_stream(&mut self) -> Option<UnixStream> {
         self.client.take_stream()

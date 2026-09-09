@@ -110,9 +110,12 @@ reconnect、pin 或 status 的 parallel vectors。新增字段必须先归入 `P
 `InputCommand` reducer。`App` 只执行语义命令；modal 文本状态仍在 App 中暂存，但不应在
 handler 内直接进行阻塞 I/O。
 
-渲染边界由 `render_model::RenderModel` 负责从 slot 派生 sidebar entries 与状态 tally，
-再交给 ratatui 绘制。daemon 控制面由 `daemon_connection::DaemonConnection` 包装，输入写入
+渲染边界由 `render_model::RenderModel` 负责从 slot 派生 sidebar entries、状态 tally，并生成
+一次性的 `OverlayModel`（Jump、Spawn、Tasks、Settings、Activity、Dashboard 等 modal 的只读
+视图数据），再交给 ratatui 绘制。daemon 控制面由 `daemon_connection::DaemonConnection` 包装，输入写入
 通过专用 writer 线程排队，避免 UI loop 等待 RPC。
+动态 session 创建同样通过短生命周期 worker connection 执行；占位 pane 在结果返回前保持
+Idle，成功后再注入 snapshot 并注册稳定 session id，失败则转为 Failed/toast。
 
 ## 配置与外部集成
 
