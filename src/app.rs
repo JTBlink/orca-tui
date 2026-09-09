@@ -289,6 +289,8 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     tasks_error: Option<String>,
     /// GitHub task-list fetch running off the UI thread.
     tasks_fetch_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<Vec<TasksEntry>>>>,
+    task_body_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    task_body_entry: Option<TasksEntry>,
     /// Phase 2 — Settings overlay: the focused row index (0..=3). 0 = Sidebar,
     /// 1 = Status bar, 2 = Default agent, 3 = Theme. Drives the ▶ cursor in
     /// [`InputMode::Settings`].
@@ -462,6 +464,8 @@ impl App {
             tasks_selected: 0,
             tasks_error: None,
             tasks_fetch_rx: None,
+            task_body_rx: None,
+            task_body_entry: None,
             settings_cursor: 0,
         })
     }
@@ -578,6 +582,7 @@ impl<B: Backend> App<B> {
             self.reap_exited();
             let had_output = self.drain_bus();
             let task_fetch_completed = self.poll_tasks_fetch();
+            let task_body_completed = self.poll_task_body_fetch();
             // After all updates (reap + bus drain) have landed on the panes,
             // capture any lifecycle/state transitions into the activity log.
             self.record_activity();
@@ -585,7 +590,7 @@ impl<B: Backend> App<B> {
             let now = Instant::now();
             // Fresh agent output counts as activity (keeps the scheduler out of
             // idle backoff while agents are producing).
-            if had_output || task_fetch_completed {
+            if had_output || task_fetch_completed || task_body_completed {
                 self.scheduler.record_activity(now);
             }
 
@@ -710,6 +715,35 @@ impl<B: Backend> App<B> {
                 self.tasks_error = Some(format!("{error:#}"));
             }
         }
+        true
+    }
+
+    /// 收取 issue body 的后台查询结果，并继续派发等待中的条目。
+    fn poll_task_body_fetch(&mut self) -> bool {
+        let Some(rx) = self.task_body_rx.as_ref() else {
+            return false;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return false;
+        };
+        self.task_body_rx = None;
+        let Some(entry) = self.task_body_entry.take() else {
+            return true;
+        };
+        let prompt = result.unwrap_or_else(|error| {
+            self.toasts.push(crate::toast::Toast::warning(format!(
+                "无法获取 issue 内容：{error}，将使用标题"
+            )));
+            entry.prompt.clone()
+        });
+        let agent = self.config.default_agent.clone();
+        let mut spec = AgentSpec::from_command(vec![agent, prompt]);
+        spec.name = format!("issue-#{}", entry.number);
+        if self.can_spawn_pane() {
+            let idx = self.spawn_one(spec);
+            self.focus = idx;
+        }
+        self.mode = InputMode::Normal;
         true
     }
 
@@ -2777,15 +2811,23 @@ impl<B: Backend> App<B> {
                     TaskKind::PullRequest => entry.prompt.clone(),
                     TaskKind::Issue => {
                         if let Some(repo) = self.tasks_repo.clone() {
-                            match crate::integrations::fetch_issue(&repo, entry.number) {
-                                Ok(full) => crate::integrations::issue_to_prompt(&full),
-                                Err(e) => {
-                                    self.toasts.push(crate::toast::Toast::warning(format!(
-                                        "could not fetch issue body: {e:#} \u{2014} using title only"
-                                    )));
-                                    entry.prompt.clone()
-                                }
-                            }
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.task_body_rx = Some(rx);
+                            self.task_body_entry = Some(entry.clone());
+                            self.mode = InputMode::TasksList;
+                            std::thread::Builder::new()
+                                .name("orca-gh-issue-body".into())
+                                .spawn(move || {
+                                    let result =
+                                        crate::integrations::fetch_issue(&repo, entry.number)
+                                            .map(|issue| {
+                                                crate::integrations::issue_to_prompt(&issue)
+                                            })
+                                            .map_err(|error| format!("{error:#}"));
+                                    let _ = tx.send(result);
+                                })
+                                .ok();
+                            return;
                         } else {
                             // No stored repo (shouldn't happen — set on
                             // TasksRepo submit). Fall back to the title-only
@@ -3468,6 +3510,8 @@ mod tests {
                 tasks_selected: 0,
                 tasks_error: None,
                 tasks_fetch_rx: None,
+                task_body_rx: None,
+                task_body_entry: None,
                 settings_cursor: 0,
             }
         }
