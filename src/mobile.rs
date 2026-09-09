@@ -29,7 +29,10 @@
 //! the client disconnects (detected via a failed send).
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -68,6 +71,8 @@ pub struct ServerInfo {
     pub token: String,
 }
 
+static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Generate a 16-hex-char pairing token from a dependency-free entropy source.
 ///
 /// Mixes the current monotonic nanos (folded with the PID) through a
@@ -86,9 +91,11 @@ pub fn random_token() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     // Fold the u128 nanos together with the PID into a 64-bit seed.
+    let sequence = TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut z = (nanos as u64)
         .wrapping_add((nanos >> 64) as u64)
         .wrapping_add(std::process::id() as u64)
+        .wrapping_add(sequence)
         ^ 0x9E37_79B9_7F4A_7C15u64;
     // splitmix64 finalizer — spreads the seed across all 64 output bits.
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9u64);
