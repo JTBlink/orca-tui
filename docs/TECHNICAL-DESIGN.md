@@ -1,271 +1,131 @@
-# Orca TUI Technical Design
+# orcatui 技术设计
 
-## Overview
+本文面向维护者，描述当前实现的模块边界、运行路径和协议约束。用户安装和操作方法见
+[根目录 README](../README.md)。协议版本与字段应以源码和 Orca 仓库对应测试为准。
 
-orca-tui is a **standalone terminal UI client** for Orca, the AI coding agent orchestrator. It connects to a running Orca instance's daemon via Unix socket, providing remote monitoring and full control from any SSH-capable device (phone, laptop, server).
+## 目标与运行路径
 
-**Architecture principle: fully decoupled.** orca-tui is an independent project. Orca's codebase is not modified. The Orca daemon's NDJSON-over-Unix-socket protocol is the stable contract between the two.
+`orcatui` 在一个 ratatui 界面中运行和观察多个命令行 Agent。每个 Agent 都有独立 PTY、
+终端模拟状态和窗格；`App` 负责输入路由、生命周期、布局、状态聚合和可选编排。
 
-## Architecture
+当前有三条互相独立的路径：
 
-```
-┌─────────────────────────┐     ┌─────────────────────────┐
-│   Orca (unmodified)      │     │   orca-tui (this repo)   │
-│                         │     │                         │
-│  ┌─────────────────┐   │     │  ┌───────────────────┐  │
-│  │ Daemon           │◄──────────│ DaemonClient       │  │
-│  │ (Unix socket)    │   │     │  │ (orca_daemon.rs)   │  │
-│  │ NDJSON + token   │   │     │  └───────────────────┘  │
-│  └─────────────────┘   │     │           │              │
-│           │             │     │           ▼              │
-│  ┌─────────────────┐   │     │  ┌───────────────────┐  │
-│  │ PTY Sessions     │   │     │  │ Ratatui Renderer   │  │
-│  │ (node-pty)       │   │     │  │ + vt100 emulator   │  │
-│  └─────────────────┘   │     │  └───────────────────┘  │
-│                         │     │           │              │
-│  ┌─────────────────┐   │     │           ▼              │
-│  │ orcad            │   │     │  ┌───────────────────┐  │
-│  │ (WebSocket RPC)  │   │     │  │ Terminal output     │  │
-│  └─────────────────┘   │     │  └───────────────────┘  │
-└─────────────────────────┘     └─────────────────────────┘
+```text
+独立模式：Agent <-> portable-pty <-> Pane <-> App <-> ratatui
+
+内置 daemon：Agent <-> DaemonServer <-> Unix socket <-> AttachClient <-> TUI
+
+Orca daemon：Orca daemon --control/stream sockets-->
+             DaemonClient <-> App <-> Pane <-> ratatui
 ```
 
-## Connection Paths
+内置 daemon 和 Orca GUI daemon 不是同一个服务，协议不能混用。代码分别位于
+`src/daemon_server.rs` 和 `src/orca_daemon.rs`。
 
-| Path | Protocol | Use Case |
-|------|----------|----------|
-| Daemon socket | NDJSON + binary frames over Unix socket | Same-machine SSH access, PTY session sharing |
-| orcad WebSocket | JSON-RPC over WebSocket | Cross-network access (future) |
+## 模块职责
 
-## Daemon Protocol Specification
+| 模块 | 职责 |
+|---|---|
+| `cli.rs` | clap 参数、命令分发、Agent 参数分组 |
+| `app.rs` | 主循环、输入状态机、窗格管理、渲染和运行时编排 |
+| `agent.rs` | Agent 类型、命令规范和生命周期状态 |
+| `bus.rs` | PTY/daemon 输出到应用的事件通道 |
+| `pane.rs` | 单个终端的模拟、滚动、选择和边框 |
+| `pty_session.rs` | 本机 PTY 创建、写入、resize、退出和回收 |
+| `terminal_emu.rs` | vt100 ANSI 解析与 cell 网格 |
+| `query.rs` / `osc.rs` / `sync.rs` | 终端能力查询、活动 OSC、mode 2026 同步输出 |
+| `scheduler.rs` / `layout.rs` / `sidebar.rs` | 刷新调度、网格布局和侧边栏 |
+| `daemon_server.rs` | 内置 daemon、attach 协议和会话持有 |
+| `orca_daemon.rs` | Orca GUI daemon v36 客户端 |
+| `worktree.rs` | Git worktree 创建、分支和生命周期清理 |
+| `coordinator.rs` | 顺序/并行任务依赖和派发 |
+| `integrations.rs` | GitHub CLI issue/PR 数据源 |
+| `ssh.rs` | SSH 目标解析、命令包装和重连策略 |
+| `mobile.rs` | 带 token 的 WebSocket snapshot 服务 |
+| `config.rs` | 配置、主题和原子保存 |
 
-### Transport
+## 独立 PTY 链路
 
-- **Unix domain socket** at a platform-specific path (see Discovery below)
-- **Two-socket model**: `control` (NDJSON RPC) + `stream` (binary frames for PTY output)
-- Both sockets authenticate via the same hello handshake
+```text
+PTY bytes
+  -> QueryResponder（响应 OSC/DECRQM/DA/DCS 查询）
+  -> OscScanner（提取 Agent 活动）
+  -> SyncScanner（原子处理 mode 2026 批次）
+  -> TerminalEmulator（vt100）
+  -> Pane
+  -> App::render
+```
 
-### Protocol Version
+子进程会注入 `TERM=xterm-256color` 和 `COLORTERM=truecolor`。应用按帧批量消费
+`AgentUpdate`，由 `FrameScheduler` 控制 60 FPS 目标和空闲退避。窗格边框使用
+`ratatui-ppalla` 的 `PreparedBlock`，终端 cell 仍由 ratatui 完整绘制。
 
-Current Orca daemon version: **36** (as of 2026-09, see `src/main/daemon/daemon-protocol-version.ts`)
+`--worktree` 时，`WorktreeManager` 在仓库根目录的 `.orca-worktrees/` 下创建
+`<slug>-<id>` 工作区和 `orca/<slug>-<id>` 分支；`OwnedWorktrees` 在应用销毁时尽力清理。
 
-Version history of notable features:
-- v36: content-addressed shell wrapper trees
-- v35: async CWD validation
-- v32: snapshot serializer fidelity
-- v30: history seed transfer
-- v29: mode 2031 unsubscribe fact
-- v27: completion process inspection
-- v25: PTY startup ingress
-- v24: clean disconnect
-- v18: getSize
-- v11: getForegroundProcess
+## 内置 daemon 协议
 
-### Hello Handshake
+内置协议版本为 `1`，使用单 Unix socket、逐行 JSON 和无 token 的 hello：
 
-Client sends on each socket:
 ```json
-{"type":"hello","version":36,"token":"<uuid>","clientId":"<uuid>","role":"control"}
-```
-```json
-{"type":"hello","version":36,"token":"<uuid>","clientId":"<uuid>","role":"stream"}
+{"type":"hello","version":1}
 ```
 
-Server responds:
-```json
-{"type":"hello","ok":true,"daemon_identity":{"pid":1234,"startedAtMs":1234567.0,"launchNonce":"abc"}}
+daemon 持有 PTY，attach 客户端断开不影响 Agent。默认 socket 是
+`$XDG_RUNTIME_DIR/orcatui.sock`，否则为 `/tmp/orcatui.sock`。该实现目前应视为单用户本机
+服务：socket 权限和客户端认证需要在引入多用户部署前补齐。
+
+## Orca GUI daemon v36
+
+`orca_daemon::PROTOCOL_VERSION` 当前为 `36`。客户端连接两个 Unix socket：control 使用
+NDJSON RPC，stream 使用二进制帧：
+
+```text
+[1 byte type][4 byte big-endian payload length][payload]
 ```
 
-On rejection:
-```json
-{"type":"hello","ok":false,"error":"reason","retryable":true}
+帧类型 `1` 为 PTY 数据，`2` 为 NDJSON 事件，单帧上限为 16 MiB。两个 socket 都要发送
+带 token、`clientId` 和 role 的 hello；control 与 stream 的 `daemonIdentity` 必须对应同一
+daemon 实例。发现逻辑查找 Orca 的 versioned `daemon-v36.sock` / token，并兼容旧布局。
+
+维护协议适配时，必须同时核对 `src/orca_daemon.rs` 与同级 `../orca/src/main/daemon/` 中的
+client、stream reader、request router 和测试。不要仅依据旧文档中的字段名或帧格式。
+
+## CLI 与状态机约束
+
+`split_agents` 的兼容语义：无 `::` 时每个 token 是一个 Agent；出现 `::` 时按分段形成
+完整 argv；空段丢弃。Normal 模式把输入转发给焦点 Agent，`Ctrl+Alt+P` 进入 Pane 模式，
+`Ctrl+Q` 为全局退出键。
+
+`App` 维护窗格、session、稳定 pane id 和 daemon session id 的并行关系。关闭或移动窗格时，
+必须按稳定 id 路由异步输出，不能把稳定 id 当作当前 Vec 下标。未知 daemon session id 应丢弃，
+不能默认注入第一个窗格。
+
+## 配置与外部集成
+
+配置读取自 `$XDG_CONFIG_HOME/orcatui/config.toml`，否则为 `$HOME/.config/orcatui/config.toml`。
+Settings 先写同目录临时文件再 rename，配置中不保存 GitHub 或 daemon 凭据。
+
+GitHub 集成通过 `gh issue list`、`gh pr list` 和 `gh issue view` 实现；`orchestrate` 把 spec
+非空行或开放 issue 转成顺序/并行任务。移动端服务当前只推送 snapshot；SSH 模式通过包装
+本地 `ssh` 命令复用 PTY 链路。
+
+## 验证与已知约束
+
+提交前运行：
+
+```bash
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features
 ```
 
-### RPC Request/Response Format
+`orcatui-inject` 用于录制和回放终端字节；`ORCA_DEBUG_LOG=1` 写入
+`/tmp/orca-live.log`。当前实现还存在以下边界，修复时应补回归测试：
 
-Request (NDJSON on control socket):
-```json
-{"id":"rpc-1","type":"methodName","payload":{...}}
-```
-
-Response:
-```json
-{"id":"rpc-1","ok":true,"payload":{...}}
-```
-
-Error:
-```json
-{"id":"rpc-1","ok":false,"error":"message"}
-```
-
-### RPC Methods
-
-| Method | Payload | Response | Description |
-|--------|---------|----------|-------------|
-| `ping` | `{}` | `{pong:true}` | Health check |
-| `listSessions` | `{}` | `{sessions:[...]}` | List active PTY sessions |
-| `createOrAttach` | `{sessionId,cols,rows,cwd?,env?,command?,...}` | session info | Create or attach to a PTY session |
-| `cancelCreateOrAttach` | `{sessionId,requestId?}` | `{canceled:bool}` | Cancel pending spawn |
-| `write` | `{sessionId,data}` | `{}` | Write input to PTY |
-| `resize` | `{sessionId,cols,rows}` | `{}` | Resize PTY |
-| `kill` | `{sessionId,immediate?}` | `{}` | Kill PTY session |
-| `signal` | `{sessionId,signal}` | `{}` | Send signal to PTY |
-| `detach` | `{sessionId}` | `{}` | Detach from session |
-| `getCwd` | `{sessionId}` | `{cwd:string}` | Get current working directory |
-| `getForegroundProcess` | `{sessionId}` | `{foregroundProcess:string}` | Get foreground process name |
-| `inspectProcess` | `{sessionId,expectedIncarnationId?,steadyState?}` | process info | Inspect running process |
-| `confirmForegroundProcess` | `{sessionId}` | `{foregroundProcess:string}` | Confirm foreground process (async) |
-| `confirmShellForeground` | `{sessionId}` | `{confirmed:bool}` | Check if shell is in foreground |
-| `clearScrollback` | `{sessionId}` | `{}` | Clear scrollback buffer |
-| `getSnapshot` | `{sessionId,scrollbackRows?}` | `{snapshot:...}` | Get terminal snapshot |
-| `getSize` | `{sessionId}` | `{size:{cols,rows}}` | Get terminal dimensions |
-| `takePendingOutput` | `{sessionId,includeSnapshot?,teardownSnapshot?}` | pending data | Take buffered output |
-| `pausePty` | `{sessionId}` | `{}` | Pause PTY output |
-| `resumePty` | `{sessionId}` | `{}` | Resume PTY output |
-| `setSessionBackground` | `{sessionId,background}` | result | Set background mode |
-| `shutdownIfIdle` | `{}` | `{retiring:bool}` | Shutdown if no sessions |
-| `shutdown` | `{killSessions}` | `{}` | Shutdown daemon |
-
-### Binary Stream Frame Format
-
-```
-[1 byte: type] [4 bytes: big-endian u32 payload length] [payload bytes]
-```
-
-| Type | Value | Payload |
-|------|-------|---------|
-| Data | 1 | Raw PTY output bytes |
-| Event | 2 | NDJSON event object |
-
-Max payload: 16 MiB.
-
-### Socket Discovery
-
-Orca stores daemon artifacts in its data directory:
-- **macOS**: `~/Library/Application Support/Orca/` (or `~/Library/Application Support/orca/`)
-- **Linux**: `$XDG_DATA_HOME/Orca/` or `~/.local/share/Orca/`
-- **orcad**: `$ORCA_USER_DATA` or `~/.orca/`
-
-Files:
-- `daemon.sock` — Unix domain socket
-- `daemon.token` — Auth token (UUID plaintext)
-
-## Technology Stack
-
-| Area | Crate | Version | Purpose |
-|------|-------|---------|---------|
-| UI rendering | `ratatui` | latest | Terminal widgets and rendering |
-| Terminal backend | `crossterm` | 0.28 | Raw mode, input, alternate screen |
-| PTY management | `portable-pty` | 0.9 | Standalone agent PTYs |
-| Terminal emulation | `vt100` | 0.15 | ANSI parsing for embedded agent output |
-| Async runtime | `tokio` | latest | Channels, timers, I/O |
-| CLI | `clap` | 4 | Argument parsing |
-| Config | `serde` + `toml` | latest | Configuration serialization |
-| WebSocket | `tokio-tungstenite` | latest | Mobile companion / future orcad path |
-
-## Key Design Decisions
-
-### Terminal-in-Terminal Rendering
-
-The central challenge: rendering another terminal's output inside orca-tui's own terminal.
-
-Solution:
-1. PTY output from daemon → `vt100` crate parses ANSI into styled cells
-2. Ratatui renders cells into bounded viewport regions
-3. Terminal capability queries from embedded agents are intercepted and responded to
-4. Synchronized output (mode 2026) sequences are buffered and emitted atomically
-
-### Input Mode Switching
-
-`Ctrl+Alt+P` toggles between:
-- **Passthrough mode**: all keystrokes forwarded to the focused agent
-- **Control mode**: navigate panes, manage agents, open overlays
-
-### Frame Scheduling
-
-- Target: 60 FPS with frame skipping
-- Idle backoff: reduce rendering when no PTY activity
-- Performance: <3ms for 20 concurrent panes
-
-## Protocol Compatibility Analysis (Verified)
-
-### Confirmed Compatible
-
-| Aspect | Orca Daemon | orca-tui (current) | Status |
-|--------|------------|-------------------|--------|
-| Transport | Unix domain socket | Unix domain socket | OK |
-| Framing | NDJSON (`\n`-delimited JSON) | NDJSON | OK |
-| Max line size | 16 MiB | 16 MiB | OK |
-| Dual-socket model | control + stream | control + stream | OK |
-| Binary frame format | `[1B type][4B BE len][payload]` | `[1B type][4B BE len][payload]` | OK |
-| Frame types | Data=1, Event=2 | Data=1, Event=2 | OK |
-| Frame max payload | 16 MiB | 16 MiB | OK |
-| RPC request format | `{id, type, payload}` | `{id, type, payload}` | OK |
-| RPC response format | `{id, ok, payload, error}` | `{id, ok, payload, error}` | OK |
-| Token auth | UUID in plaintext file, mode 0o600 | UUID from file, trimmed | OK |
-| Clean detach on drop | Sends `{type:"detach"}` | Sends `{type:"detach"}` | OK |
-
-### Gaps Requiring Fix
-
-#### 1. Protocol Version: 28 → 36 (CRITICAL)
-
-- **File**: `src/orca_daemon.rs` line 37
-- **Current**: `pub const PROTOCOL_VERSION: u32 = 28;`
-- **Required**: `pub const PROTOCOL_VERSION: u32 = 36;`
-- **Impact**: Orca daemon rejects hello if version doesn't match exactly. Connection will fail.
-
-#### 2. Hello Field Name: `client_id` vs `clientId` (CRITICAL)
-
-- **orca-tui sends**: `{"type":"hello","version":28,"token":"...","client_id":"...","role":"control"}`
-- **Orca expects**: `{"type":"hello","version":36,"token":"...","clientId":"...","role":"control"}`
-- **File**: `src/orca_daemon.rs` line 105 — `HelloMessage` struct uses `client_id` (snake_case)
-- **Fix**: Add `#[serde(rename = "clientId")]` to the `client_id` field
-
-#### 3. Hello Response Field: `daemon_identity` vs `daemonIdentity` (MODERATE)
-
-- **Orca sends**: `{"type":"hello","ok":true,"daemonIdentity":{...}}`
-- **orca-tui expects**: `{"type":"hello","ok":true,"daemon_identity":{...}}`
-- **File**: `src/orca_daemon.rs` line 143 — `HelloResponse` deserializes `daemon_identity`
-- **Fix**: Add `#[serde(alias = "daemonIdentity")]` or rename field with `#[serde(rename = "daemonIdentity")]`
-
-#### 4. Socket Discovery Path (MODERATE)
-
-- **orca-tui searches**: `~/.config/orca/daemon.sock`, `~/.local/share/orca/daemon.sock`
-- **Orca actual path**: `<userData>/daemon/daemon-v36.sock` (versioned filename!)
-  - macOS: `~/Library/Application Support/Orca/daemon/daemon-v36.sock`
-  - Linux: `~/.config/Orca/daemon/daemon-v36.sock` (note: capitalized "Orca")
-- **File**: `src/orca_daemon.rs` lines 325-341 — `DaemonEndpoint::discover()`
-- **Fix**: Update path candidates to match Orca's actual layout, include versioned filename pattern `daemon-v*.sock`
-
-#### 5. Stream Events: NDJSON vs Binary (LOW)
-
-- **Orca daemon** sends stream events as **binary frames** (type=2) containing NDJSON
-- **orca-tui** correctly reads binary frames via `read_frame()` and `FrameType::Event`
-- Status: Compatible. No fix needed.
-
-#### 6. Fire-and-Forget Notifications (LOW)
-
-- **Orca daemon** skips response when `id` starts with `notify_` prefix
-- **orca-tui** always reads a response after `rpc()` call
-- **Impact**: If orca-tui sends `write`/`resize` as regular RPC (with `rpc-N` id), it works fine — just slower than using notify prefix
-- **Optimization**: Add `notify()` method using `notify_` prefix for write/resize/pausePty/resumePty
-
-#### 7. Missing High-Level RPC Methods (LOW)
-
-orca-tui only wraps `ping` and `listSessions`. These additional methods are available via generic `rpc()` but would benefit from typed wrappers:
-- `createOrAttach` — spawn or attach to a PTY session
-- `getSnapshot` — get terminal state with optional scrollback
-- `getSize` — get terminal dimensions
-- `write` / `resize` / `kill` / `signal` — session control
-- `getCwd` / `getForegroundProcess` / `inspectProcess` — process inspection
-
-### Fix Priority
-
-| # | Fix | Priority | Effort |
-|---|-----|----------|--------|
-| 1 | Protocol version 28→36 | P0 (blocks connection) | 1 line |
-| 2 | Hello `client_id`→`clientId` | P0 (blocks connection) | 1 serde attr |
-| 3 | Hello response `daemon_identity`→`daemonIdentity` | P1 (breaks identity parse) | 1 serde attr |
-| 4 | Socket discovery paths | P1 (can't find daemon) | ~20 lines |
-| 5 | Notify prefix optimization | P2 (perf only) | ~15 lines |
-| 6 | Typed RPC wrappers | P2 (ergonomics) | ~50 lines |
+- daemon 初始窗格、daemon stream 断线、关闭 daemon 窗格和动态命令参数需要保持一致的会话语义。
+- 内置 daemon 的 socket 认证/权限与广播背压尚未达到多用户服务要求。
+- 移动服务不应在非必要场景绑定 `0.0.0.0`，配对 token 应使用 CSPRNG。
+- 自定义 Spawn 命令只按空白拆分，不解析 shell 引号。
+- Tasks 的 `gh` 请求为同步调用，慢网络会暂时阻塞界面。
+- SSH IPv6、重连次数和 worktree 清理失败路径需要单独覆盖。
