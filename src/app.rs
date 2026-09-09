@@ -1921,7 +1921,7 @@ impl<B: Backend> App<B> {
                 use ratatui::style::Modifier;
                 use ratatui::text::Span;
                 use ratatui::widgets::{Block, BorderType, Borders, Clear};
-                let n = jump_filtered_idx.len();
+                let n = render_model.overlay.jump_filtered.len();
                 let pop_h = (n as u16 + 3).min(total.height.saturating_sub(4)).max(5);
                 let pop_w = total.width.min(64).max(40);
                 let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
@@ -1943,7 +1943,7 @@ impl<B: Backend> App<B> {
                 // Query line with a block cursor.
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("/{}", jump_query),
+                        format!("/{}", render_model.overlay.jump_query),
                         Style::default().fg(theme.accent()),
                     ),
                     Span::styled(
@@ -1954,15 +1954,12 @@ impl<B: Backend> App<B> {
                     ),
                 ]));
                 lines.push(Line::default());
-                for (i, &pane_idx) in jump_filtered_idx.iter().enumerate() {
+                for (i, (_pane_idx, name)) in render_model.overlay.jump_filtered.iter().enumerate()
+                {
                     if i as u16 + 3 > inner.height {
                         break;
                     }
-                    let name = panes
-                        .get(pane_idx)
-                        .map(|p| p.name().to_string())
-                        .unwrap_or_default();
-                    let selected = i == jump_selected;
+                    let selected = i == render_model.overlay.jump_selected;
                     let style = if selected {
                         Style::default()
                             .fg(theme.accent())
@@ -1984,7 +1981,7 @@ impl<B: Backend> App<B> {
                 use ratatui::widgets::{Block, BorderType, Borders, Clear};
                 // ~3 items per 12 rows of terminal height, clamped to [2, 6]
                 let max_visible = ((total.height / 12) as usize).clamp(2, 6);
-                let n = spawn_opts.len();
+                let n = render_model.overlay.spawn_options.len();
                 let visible = n.min(max_visible);
                 let pop_h = (visible as u16 + 3)
                     .min(total.height.saturating_sub(4))
@@ -2004,16 +2001,21 @@ impl<B: Backend> App<B> {
                 let inner = block.inner(pop);
 
                 // Scroll offset: keep the selected item visible.
-                let scroll = spawn_selected.saturating_sub(max_visible.saturating_sub(1));
+                let scroll = render_model
+                    .overlay
+                    .spawn_selected
+                    .saturating_sub(max_visible.saturating_sub(1));
 
                 let mut lines: Vec<Line> = Vec::new();
-                for (i, (name, cmd_first)) in spawn_opts
+                for (i, (name, cmd_first)) in render_model
+                    .overlay
+                    .spawn_options
                     .iter()
                     .enumerate()
                     .skip(scroll)
                     .take(usize::from(inner.height))
                 {
-                    let selected = i == spawn_selected;
+                    let selected = i == render_model.overlay.spawn_selected;
                     let style = if selected {
                         Style::default()
                             .fg(theme.accent())
@@ -2031,7 +2033,7 @@ impl<B: Backend> App<B> {
                 }
                 // Scroll indicator.
                 if n > max_visible {
-                    let more_below = spawn_selected + 1 < n;
+                    let more_below = render_model.overlay.spawn_selected + 1 < n;
                     let more_above = scroll > 0;
                     let indicator = match (more_above, more_below) {
                         (true, true) => " ↑↓ more ",
@@ -2071,10 +2073,12 @@ impl<B: Backend> App<B> {
                 let inner = block.inner(pop);
                 // `activity_lines` is newest-first (recent() returns newest-first),
                 // so the most recent transition renders at the top.
-                let lines: Vec<Line> = if activity_lines.is_empty() {
+                let lines: Vec<Line> = if render_model.overlay.activity_lines.is_empty() {
                     vec![Line::from("(no activity yet)").style(Style::default().fg(theme.muted()))]
                 } else {
-                    activity_lines
+                    render_model
+                        .overlay
+                        .activity_lines
                         .iter()
                         .take(usize::from(inner.height))
                         .map(|s| Line::from(s.as_str()).style(Style::default().fg(theme.fg())))
@@ -2125,7 +2129,7 @@ impl<B: Backend> App<B> {
                 let mut needs: Vec<&str> = Vec::new();
                 let mut working_b: Vec<&str> = Vec::new();
                 let mut done: Vec<&str> = Vec::new();
-                for (name, status) in &dashboard_entries {
+                for (name, status) in &render_model.overlay.dashboard_entries {
                     match status {
                         AgentStatus::Blocked | AgentStatus::Interrupted | AgentStatus::Failed => {
                             needs.push(name.as_str());
