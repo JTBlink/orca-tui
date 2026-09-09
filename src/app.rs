@@ -43,6 +43,7 @@ use crate::agent::{status_tally, AgentKind, AgentSpec, AgentState, AgentStatus};
 use crate::bus::{self, AgentUpdate, AgentUpdateReceiver, AgentUpdateSender};
 use crate::config::{Config, LayoutConfig};
 use crate::coordinator::{self, Coordinator};
+use crate::input::{self, FocusDirection as FocusDir, InputCommand, InputMode};
 use crate::integrations::RepoRef;
 use crate::layout::split_panes;
 use crate::mobile::AgentSnapshot;
@@ -56,46 +57,6 @@ use crate::terminal_emu::{MIN_COLS, MIN_ROWS};
 use crate::worktree::{OwnedWorktrees, WorktreeManager};
 
 use tokio::sync::mpsc::UnboundedSender;
-
-/// Input mode — zellij-style. Normal = passthrough, Pane = focus nav,
-/// the fuzzy-focus palette (`/` from Pane mode), or the spawn picker
-/// (`Ctrl+N`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum InputMode {
-    #[default]
-    Normal,
-    Pane,
-    /// Fuzzy-focus jump palette: type to filter agents, Enter to focus.
-    Jump,
-    /// Agent-spawn picker: Up/Down to select, Enter to spawn, Esc to cancel.
-    Spawn,
-    /// Full-screen activity timeline overlay: any key closes it.
-    Activity,
-    /// Read-only 3-bucket agent dashboard overlay (Phase 2): groups the
-    /// live per-pane statuses into needs-attention / working / done columns.
-    /// Opened with `d` in Pane mode; any key dismisses it back to Normal.
-    Dashboard,
-    /// Sidebar navigation menu: ↑↓ moves between items, Enter dispatches,
-    /// Esc returns to Normal. Ctrl+S enters it from any mode.
-    Sidebar,
-    /// Custom-command text-entry modal (reached from the spawn picker's
-    /// "Custom command…" sentinel entry): type a command, Enter spawns it.
-    SpawnCustom,
-    /// Tasks view (Phase 2): repo-input text modal. Reached from the sidebar
-    /// nav hub. User types `owner/name`, Enter fetches open issues + PRs and
-    /// switches to [`InputMode::TasksList`].
-    TasksRepo,
-    /// Tasks view (Phase 2): the fetched issues/PRs list browser. ↑↓ selects,
-    /// Enter dispatches a new agent pane with the issue/PR body as the prompt,
-    /// Esc returns to Normal.
-    TasksList,
-    /// Settings overlay (Phase 2): live toggle/cycle of layout, default-agent,
-    /// and theme. ↑↓ moves the cursor, Enter/Space toggles the focused row
-    /// (applied live to the render), Esc persists the whole config to
-    /// `~/.config/orcatui/config.toml` via [`Config::save`] and returns to
-    /// Normal.
-    Settings,
-}
 
 /// The daemon connection state — drives the sidebar indicator + error handling.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -139,14 +100,6 @@ impl ConnectionState {
     pub fn is_standalone(&self) -> bool {
         matches!(self, Self::Standalone)
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum FocusDir {
-    Up,
-    Down,
-    Left,
-    Right,
 }
 
 const FOOTER_NORMAL: &str = " Ctrl+Alt+P: control \u{00B7} Ctrl+Q: quit ";
@@ -2435,6 +2388,14 @@ impl<B: Backend> App<B> {
             self.show_help = false;
             return;
         }
+        // Normal/Pane keys are reduced to semantic commands in the dedicated
+        // input seam. Modal-specific text handlers remain below.
+        if matches!(self.mode, InputMode::Normal | InputMode::Pane) {
+            if let Some(command) = input::reduce_key(self.mode, key) {
+                self.apply_input_command(command);
+                return;
+            }
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Ctrl+Alt+P gateway (Alt adds an ESC-prefix byte so it's distinct
         // from Ctrl+P, which opencode uses for its command palette).
@@ -2587,6 +2548,38 @@ impl<B: Backend> App<B> {
             InputMode::TasksRepo => self.handle_tasks_repo_key(key),
             InputMode::TasksList => self.handle_tasks_list_key(key),
             InputMode::Settings => self.handle_settings_key(key),
+        }
+    }
+
+    /// 执行输入 reducer 产生的语义命令；这里不解析原始按键，也不执行外部 I/O。
+    fn apply_input_command(&mut self, command: InputCommand) {
+        match command {
+            InputCommand::Noop => {}
+            InputCommand::Quit => self.quit = true,
+            InputCommand::EnterPaneMode => self.mode = InputMode::Pane,
+            InputCommand::SetNormalMode => self.mode = InputMode::Normal,
+            InputCommand::Forward(key) => self.forward_key_to_agent(key),
+            InputCommand::Focus(direction) => self.focus_directional(direction),
+            InputCommand::TogglePin => self.toggle_pin_focused(),
+            InputCommand::ClosePane => self.close_focused_pane(),
+            InputCommand::ToggleZoom => self.zoomed = !self.zoomed,
+            InputCommand::ToggleHelp => self.show_help = !self.show_help,
+            InputCommand::OpenJump => {
+                self.jump_query.clear();
+                self.jump_selected = 0;
+                self.mode = InputMode::Jump;
+            }
+            InputCommand::OpenActivity => self.mode = InputMode::Activity,
+            InputCommand::OpenDashboard => self.mode = InputMode::Dashboard,
+            InputCommand::OpenSpawn => {
+                self.spawn_selected = 0;
+                self.mode = InputMode::Spawn;
+            }
+            InputCommand::ToggleSidebar => self.sidebar_hidden = !self.sidebar_hidden,
+            InputCommand::OpenSidebar => {
+                self.mode = InputMode::Sidebar;
+                self.sidebar_nav = 0;
+            }
         }
     }
 

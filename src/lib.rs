@@ -21,6 +21,7 @@ pub mod coordinator;
 pub mod crashlog;
 pub mod daemon_server;
 pub mod hangul;
+pub(crate) mod input;
 pub mod integrations;
 pub mod layout;
 pub mod mobile;
