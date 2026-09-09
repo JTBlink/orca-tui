@@ -39,7 +39,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
 use crate::activity::{ActivityEvent, ActivityLog};
-use crate::agent::{status_tally, AgentKind, AgentSpec, AgentState, AgentStatus};
+use crate::agent::{AgentKind, AgentSpec, AgentState, AgentStatus};
 use crate::bus::{self, AgentUpdate, AgentUpdateReceiver, AgentUpdateSender};
 use crate::config::{Config, LayoutConfig};
 use crate::coordinator::{self, Coordinator};
@@ -50,6 +50,7 @@ use crate::mobile::AgentSnapshot;
 use crate::pane::Pane;
 use crate::pane_slot::PaneSlot;
 use crate::pty_session::PtySession;
+use crate::render_model::RenderModel;
 use crate::scheduler::{FrameScheduler, TARGET_FRAME_60FPS};
 use crate::sidebar;
 use crate::ssh;
@@ -1546,20 +1547,10 @@ impl<B: Backend> App<B> {
             }
         }
 
-        // Build sidebar entries (owned Vec, no borrow held across the closure).
-        let sidebar_entries: Vec<sidebar::SidebarEntry> = self
-            .panes
-            .iter()
-            .enumerate()
-            .map(|(i, p)| sidebar::SidebarEntry {
-                name: p.name().to_string(),
-                state: p.state().clone(),
-                branch: p.branch().map(String::from),
-                activity: p.activity().cloned(),
-                focused: i == self.focus,
-                pinned: self.panes.get(i).map(|slot| slot.pinned).unwrap_or(false),
-            })
-            .collect();
+        // Derive an immutable render model before borrowing panes mutably for
+        // viewport reconciliation and drawing.
+        let render_model = RenderModel::from_slots(&self.panes, self.focus);
+        let sidebar_entries = render_model.sidebar_entries.clone();
 
         let focus = self.focus;
         let zoomed_render = zoomed;
@@ -1654,11 +1645,7 @@ impl<B: Backend> App<B> {
         let panes = &mut self.panes;
         let theme = &self.config.theme;
         // Agent status tallies for the footer status bar (opencode-style).
-        let statuses: Vec<AgentStatus> = sidebar_entries
-            .iter()
-            .map(|e| AgentStatus::derive(&e.state, e.activity.as_ref().map(|a| a.state.as_str())))
-            .collect();
-        let tally = status_tally(&statuses);
+        let tally = render_model.tally;
         self.terminal.draw(|f| {
             if let Some(sb) = sidebar_area {
                 let conn_status = match self.conn_state {

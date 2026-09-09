@@ -1,0 +1,68 @@
+//! 纯渲染模型。
+//!
+//! `RenderModel` 从运行时 pane slot 派生 sidebar 和状态汇总数据；它不持有
+//! PTY、daemon 或终端句柄，使渲染准备步骤可以独立测试。
+
+use crate::agent::{status_tally, AgentStatus};
+use crate::pane_slot::PaneSlot;
+use crate::sidebar::SidebarEntry;
+
+/// 一帧 TUI 所需的只读派生数据。
+#[derive(Debug, Clone)]
+pub(crate) struct RenderModel {
+    pub(crate) sidebar_entries: Vec<SidebarEntry>,
+    pub(crate) statuses: Vec<AgentStatus>,
+    pub(crate) tally: crate::agent::StatusTally,
+}
+
+impl RenderModel {
+    /// 从当前 slot 集合生成渲染模型。
+    #[must_use]
+    pub(crate) fn from_slots(slots: &[PaneSlot], focus: usize) -> Self {
+        let sidebar_entries = slots
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| SidebarEntry {
+                name: slot.name().to_string(),
+                state: slot.state().clone(),
+                branch: slot.branch().map(String::from),
+                activity: slot.activity().cloned(),
+                focused: i == focus,
+                pinned: slot.pinned,
+            })
+            .collect::<Vec<_>>();
+        let statuses = sidebar_entries
+            .iter()
+            .map(|entry| {
+                AgentStatus::derive(
+                    &entry.state,
+                    entry.activity.as_ref().map(|a| a.state.as_str()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let tally = status_tally(&statuses);
+        Self {
+            sidebar_entries,
+            statuses,
+            tally,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pane::Pane;
+
+    #[test]
+    fn model_derives_focus_pin_and_status_from_slots() {
+        let mut first = PaneSlot::new(Pane::new(1, "first", 40, 8), vec!["echo".into()]);
+        first.pinned = true;
+        let second = PaneSlot::new(Pane::new(2, "second", 40, 8), vec!["true".into()]);
+        let model = RenderModel::from_slots(&[first, second], 1);
+        assert!(model.sidebar_entries[0].pinned);
+        assert!(model.sidebar_entries[1].focused);
+        assert_eq!(model.statuses.len(), 2);
+        assert_eq!(model.tally.total(), 2);
+    }
+}

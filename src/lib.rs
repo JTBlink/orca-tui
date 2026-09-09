@@ -32,6 +32,7 @@ pub(crate) mod pane_slot;
 pub mod perf_probe;
 pub mod pty_session;
 pub mod query;
+pub(crate) mod render_model;
 pub mod scheduler;
 pub mod sidebar;
 pub mod ssh;
