@@ -19,6 +19,7 @@ pub mod clipboard;
 pub mod config;
 pub mod coordinator;
 pub mod crashlog;
+pub(crate) mod daemon_connection;
 pub mod daemon_server;
 pub mod hangul;
 pub(crate) mod input;

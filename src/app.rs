@@ -43,6 +43,7 @@ use crate::agent::{AgentKind, AgentSpec, AgentState, AgentStatus};
 use crate::bus::{self, AgentUpdate, AgentUpdateReceiver, AgentUpdateSender};
 use crate::config::{Config, LayoutConfig};
 use crate::coordinator::{self, Coordinator};
+use crate::daemon_connection::DaemonConnection;
 use crate::input::{self, FocusDirection as FocusDir, InputCommand, InputMode};
 use crate::integrations::RepoRef;
 use crate::layout::split_panes;
@@ -244,7 +245,7 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// Transient UI messages (daemon errors, connection changes, etc.).
     toasts: crate::toast::ToastQueue,
     /// The daemon client when connected to an Orca daemon (None in standalone).
-    daemon: Option<crate::orca_daemon::DaemonClient>,
+    daemon: Option<DaemonConnection>,
     /// In-memory activity timeline (state transitions + errors). Rendered as a
     /// full-screen overlay via `InputMode::Activity`.
     activity: ActivityLog,
@@ -1114,14 +1115,14 @@ impl<B: Backend> App<B> {
     /// falls back to standalone silently (no daemon found) or with a toast
     /// (daemon found but connection rejected).
     pub fn try_connect_daemon(&mut self) {
-        use crate::orca_daemon::{DaemonClient, DaemonConnectOptions, DaemonError};
+        use crate::orca_daemon::{DaemonConnectOptions, DaemonError};
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
         let opts = DaemonConnectOptions {
             rpc_timeout: Duration::from_secs(self.config.daemon.rpc_timeout_secs),
             hello_timeout: Duration::from_secs(self.config.daemon.hello_timeout_secs),
         };
-        match DaemonClient::try_connect_with(opts) {
+        match DaemonConnection::try_connect(opts) {
             None => {
                 // No daemon socket found — silent standalone fallback.
             }
@@ -1150,9 +1151,10 @@ impl<B: Backend> App<B> {
                     let _ = thread::Builder::new()
                         .name("orca-daemon-stream".to_string())
                         .spawn(move || {
-                            use crate::orca_daemon::{DaemonClient, FrameType};
+                            use crate::daemon_connection::DaemonConnection;
+                            use crate::orca_daemon::FrameType;
                             loop {
-                                match DaemonClient::read_stream_frame(&mut stream) {
+                                match DaemonConnection::read_stream_frame(&mut stream) {
                                     Ok(frame) => {
                                         match frame.ftype {
                                             FrameType::Data => {
@@ -1311,7 +1313,7 @@ impl<B: Backend> App<B> {
     /// reconnect. On success: rebuilds the session map and pushes a success
     /// toast. On failure: doubles the backoff (capped at 30s) and tries again.
     fn pump_daemon_reconnect(&mut self) {
-        use crate::orca_daemon::{DaemonClient, DaemonError};
+        use crate::orca_daemon::DaemonError;
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
 
@@ -1328,7 +1330,7 @@ impl<B: Backend> App<B> {
         }
 
         // Attempt reconnection.
-        match DaemonClient::try_connect() {
+        match DaemonConnection::try_connect(crate::orca_daemon::DaemonConnectOptions::default()) {
             None => {
                 // Daemon disappeared entirely — give up, go standalone.
                 self.conn_state = ConnectionState::Standalone;
@@ -1357,9 +1359,10 @@ impl<B: Backend> App<B> {
                     let _ = thread::Builder::new()
                         .name("orca-daemon-stream".to_string())
                         .spawn(move || {
-                            use crate::orca_daemon::{DaemonClient, FrameType};
+                            use crate::daemon_connection::DaemonConnection;
+                            use crate::orca_daemon::FrameType;
                             loop {
-                                match DaemonClient::read_stream_frame(&mut stream) {
+                                match DaemonConnection::read_stream_frame(&mut stream) {
                                     Ok(frame) => match frame.ftype {
                                         FrameType::Data => {
                                             if let Some((pane_id, bytes)) =
