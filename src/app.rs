@@ -398,8 +398,8 @@ impl App {
         // Monotonic pane-id allocator: each pane gets a globally-unique id
         // (never reused across close+spawn cycles), so the bus forwarder keeps
         // targeting the RIGHT pane after positions shift. `idx` below is still
-        // the spawn-time vec position (used for the parallel-vec pushes), but
-        // the forwarder is handed the stable `id`, not `idx`.
+        // the spawn-time vector position is only a layout index; forwarders
+        // receive the stable `id` instead.
         let mut next_id = 0usize;
 
         for (idx, spec) in specs.into_iter().enumerate() {
@@ -744,8 +744,8 @@ impl<B: Backend> App<B> {
     /// duplicate `Tool` events. State + Error transitions are the high-signal
     /// set; per-tool dedup can be added (via a `last_tool` field) in a follow-up.
     fn record_activity(&mut self) {
-        // Keep the per-pane previous-status vec in lockstep with `panes` so a
-        // mid-run `spawn_one` (which appends to `panes`) doesn't desync it.
+        // Status history lives on each slot, so dynamic panes need no side
+        // vector bookkeeping.
         for slot in self.panes.iter_mut() {
             let name = slot.name().to_string();
             let new = AgentStatus::derive(slot.state(), slot.activity().map(|a| a.state.as_str()));
@@ -852,7 +852,7 @@ impl<B: Backend> App<B> {
             AgentUpdate::Output { pane_id, bytes } => {
                 // The forwarder (and daemon stream reader) report the pane by
                 // its STABLE id; resolve to a position before indexing the
-                // parallel vecs. After a close, positions shift, so indexing
+                // slot collection. After a close, positions shift, so indexing
                 // by the stale id-as-position would target the wrong pane (or
                 // drop the update entirely). A closed pane's updates are
                 // silently dropped — the forwarder will exit on its own once
@@ -912,8 +912,7 @@ impl<B: Backend> App<B> {
                 }
             }
             AgentUpdate::Exit { pane_id, code } => {
-                // Resolve the stable id to a position ONCE; every parallel-vec
-                // access below uses this resolved position. If the pane is gone
+                // Resolve the stable id to a position ONCE. If the pane is gone
                 // (closed), the exit is a no-op.
                 let Some(pane_id) = self.idx_of_pane(pane_id) else {
                     return;
@@ -4203,10 +4202,7 @@ mod tests {
     #[test]
     fn spawn_one_failed_command_adds_failed_pane_and_keeps_vecs_aligned() {
         // Ctrl+N path: spawning an agent whose binary isn't on PATH must NOT
-        // panic, must add exactly one Failed pane, and must keep every parallel
-        // per-pane vector (sessions/pane_task/pane_command/reconnect/reconnect_due/
-        // pinned) the same length as `panes`. A length mismatch here is exactly
-        // the class of bug that broke Ctrl+N at runtime.
+        // panic, and must add exactly one Failed slot.
         let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
         let before = app.panes.len();
         let idx = app.spawn_one(AgentSpec::from_command(vec![
@@ -4724,7 +4720,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_n_spawns_a_new_pane_and_keeps_parallel_vecs_aligned() {
+    fn ctrl_n_spawns_a_new_pane_as_a_complete_slot() {
         let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
         let before = app.panes.len();
         // Spawn picker moved behind the gateway: enter Pane (Ctrl+Alt+P),
@@ -5343,7 +5339,7 @@ mod tests {
         assert_eq!(app.focus, 1, "focus clamped to the new last pane");
     }
 
-    /// Closing every pane must fully drain the parallel vecs and reset the app
+    /// Closing every pane must fully drain the slot collection and reset the app
     /// to a sane empty state (Normal mode, zoom cleared) so a later spawn or
     /// render doesn't index into stale state.
     #[test]
@@ -5388,17 +5384,13 @@ mod tests {
         );
     }
 
-    /// Blast-radius test: a close → spawn → close sequence must keep ALL
-    /// parallel per-pane Vecs the same length at every step. A single desync
-    /// (the historical `last_status` bug) leaves stale slots that misroute
-    /// updates or panic on indexed access. `last_status` is lazily grown in
-    /// `record_activity`, so grow it first to make its close-time remove
-    /// observable, and assert it never exceeds `panes.len()`.
+    /// Blast-radius test: a close → spawn → close sequence keeps each slot's
+    /// identity and state self-contained.
     #[test]
-    fn parallel_vecs_stay_in_lockstep_across_close_spawn_close() {
+    fn slots_stay_consistent_across_close_spawn_close() {
         let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b"), pane(2, "c"), pane(3, "d")]);
         app.next_pane_id = app.panes.len(); // 4 ids issued
-                                            // Grow last_status so it's a real parallel vec we can watch desync.
+                                            // Establish activity baselines on each slot.
         app.record_activity();
         assert!(app.panes.iter().all(|slot| slot.last_status.is_some()));
 
@@ -5408,7 +5400,7 @@ mod tests {
         assert_eq!(app.panes.len(), 3);
         assert!(app.panes.iter().all(|slot| slot.last_status.is_some()));
 
-        // Step 2: spawn a fresh pane (id from the counter, pushes every vec).
+        // Step 2: spawn a fresh pane (id from the counter).
         app.spawn_one(AgentSpec::from_command(vec!["bash".to_string()]));
         assert_eq!(app.panes.len(), 4);
         assert!(app
@@ -5416,8 +5408,7 @@ mod tests {
             .iter()
             .all(|slot| slot.command.is_empty() || !slot.command.is_empty()));
 
-        // Step 3: close idx 0 — exercises the guarded `last_status.remove`
-        // and keeps every other vec in lockstep.
+        // Step 3: close idx 0 — the remaining slots stay independent.
         app.focus = 0;
         app.close_focused_pane();
         assert_eq!(app.panes.len(), 3);

@@ -102,8 +102,9 @@ pin 和活动状态。Vec position 只承担布局与焦点索引；异步输出
 位置，不能把稳定 id 当作当前 Vec 下标。未知 daemon session id 应丢弃，不能默认注入第一个
 窗格。
 
-当前迁移阶段仍保留少量 session/reconnect 等兼容镜像，供旧调用方和回归测试使用；新代码应以
-`PaneSlot` 为 per-pane 状态入口，后续收缩阶段会删除这些镜像并移除 lockstep 约束。
+所有 per-pane 生命周期字段均由 `PaneSlot` 唯一持有；App 不再维护 session、task、command、
+reconnect、pin 或 status 的 parallel vectors。新增字段必须先归入 `PaneSlot`，Vec position
+只能作为布局和焦点索引。
 
 ## 配置与外部集成
 
