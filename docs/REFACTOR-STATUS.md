@@ -25,8 +25,10 @@ cargo test --lib
 cargo clippy --all-targets --all-features
 ```
 
-当前环境中 `cargo fmt --check`、`cargo check --lib` 和 `cargo test --lib` 已通过；完整库测试为
-`440 passed, 6 ignored`。Clippy 可执行，但仓库还存在若干历史 lint（主要是 unused/dead-code、
+当前环境中 `cargo fmt --check`、`cargo check --lib` 和串行完整测试
+`cargo test -- --test-threads=1` 已通过（库 `440 passed, 6 ignored`，其他 targets 与 doctest
+也通过）。并行运行时已有两个历史测试存在共享临时配置/随机 token 的偶发竞争，单测串行可稳定复现
+通过。Clippy 可执行，但仓库还存在若干历史 lint（主要是 unused/dead-code、
 signal handler 和跨模块风格建议），后续可单独清理，不应把这些 warning 误认为协议或行为回归。
 
 ## 兼容性与迁移风险
