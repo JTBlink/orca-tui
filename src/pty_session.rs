@@ -395,9 +395,14 @@ mod tests {
         let row0: String = (0..80)
             .filter_map(|x| emu.cell(x, 0).map(|c| c.chars.clone()))
             .collect();
+        let expected = dir
+            .canonicalize()
+            .unwrap_or_else(|_| dir.clone())
+            .display()
+            .to_string();
         assert!(
-            row0.contains(&dir.display().to_string()),
-            "pwd should print cwd {dir:?}; got {row0:?}"
+            row0.contains(&expected),
+            "pwd should print cwd {dir:?} (canonical {expected:?}); got {row0:?}"
         );
         let _ = poll_exit_code(&mut session);
     }

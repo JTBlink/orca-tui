@@ -537,7 +537,11 @@ mod tests {
 
         let wt = mgr.create_for("Claude Code").expect("create");
         assert!(wt.path.is_dir(), "worktree path should exist");
-        assert!(wt.path.starts_with(repo.path.join(WORKTREE_DIR)));
+        assert!(wt
+            .path
+            .canonicalize()
+            .unwrap()
+            .starts_with(repo.path.canonicalize().unwrap().join(WORKTREE_DIR)));
         assert!(
             wt.branch.starts_with("orca/claude-code-"),
             "unexpected branch: {}",
@@ -678,7 +682,11 @@ mod tests {
             "unexpected branch: {}",
             wt.branch
         );
-        assert!(wt.path.starts_with(repo.path.join(WORKTREE_DIR)));
+        assert!(wt
+            .path
+            .canonicalize()
+            .unwrap()
+            .starts_with(repo.path.canonicalize().unwrap().join(WORKTREE_DIR)));
         assert!(repo.worktree_listed(&wt.path));
     }
 
