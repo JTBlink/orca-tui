@@ -3295,31 +3295,7 @@ impl<B: Backend> App<B> {
                 Some(id) => id.clone(),
                 None => return, // no daemon session for this pane yet
             };
-            match daemon.rpc(
-                "write",
-                serde_json::json!({
-                    "sessionId": session_id,
-                    "data": String::from_utf8_lossy(bytes),
-                }),
-            ) {
-                Ok(_) => {}
-                Err(crate::orca_daemon::DaemonError::Disconnected { reason }) => {
-                    self.conn_state = ConnectionState::Disconnected {
-                        reason: reason.clone(),
-                        next_retry: Some(Instant::now() + Duration::from_secs(3)),
-                    };
-                    self.toasts.push(crate::toast::Toast::error(format!(
-                        "Daemon disconnected: {reason}"
-                    )));
-                    // Drop the daemon client — it's dead.
-                    self.daemon = None;
-                }
-                Err(e) => {
-                    self.toasts.push(crate::toast::Toast::warning(format!(
-                        "RPC write failed: {e}"
-                    )));
-                }
-            }
+            daemon.enqueue_write(session_id, bytes.to_vec());
             return;
         }
         // Standalone mode: write directly to the local PTY.

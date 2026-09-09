@@ -5,6 +5,8 @@
 //! out of input/render code.
 
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc::{self, Sender};
+use std::thread;
 
 use crate::orca_daemon::{
     DaemonClient, DaemonConnectOptions, DaemonEndpoint, DaemonError, DaemonIdentity, Frame,
@@ -13,12 +15,21 @@ use crate::orca_daemon::{
 /// 供 App 使用的 daemon 连接边界。
 pub(crate) struct DaemonConnection {
     client: DaemonClient,
+    options: DaemonConnectOptions,
+    write_tx: Option<Sender<(String, Vec<u8>)>>,
 }
 
 impl DaemonConnection {
     /// 使用给定超时选项尝试建立连接。
     pub(crate) fn try_connect(options: DaemonConnectOptions) -> Option<Result<Self, DaemonError>> {
-        DaemonClient::try_connect_with(options).map(|result| result.map(|client| Self { client }))
+        let saved_options = options.clone();
+        DaemonClient::try_connect_with(options).map(|result| {
+            result.map(|client| Self {
+                client,
+                options: saved_options,
+                write_tx: None,
+            })
+        })
     }
 
     /// 连接对应的 daemon 身份。
@@ -39,6 +50,36 @@ impl DaemonConnection {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, DaemonError> {
         self.client.rpc(method, params)
+    }
+
+    /// 将输入排入专用 writer 线程，避免 UI loop 等待 daemon RPC 响应。
+    pub(crate) fn enqueue_write(&mut self, session_id: String, data: Vec<u8>) {
+        if self.write_tx.is_none() {
+            let (tx, rx) = mpsc::channel::<(String, Vec<u8>)>();
+            let endpoint = self.client.endpoint().clone();
+            let options = self.options.clone();
+            thread::Builder::new()
+                .name("orca-daemon-writer".into())
+                .spawn(move || {
+                    let Ok(mut writer) = DaemonClient::connect_with(endpoint, options) else {
+                        return;
+                    };
+                    while let Ok((session_id, data)) = rx.recv() {
+                        let _ = writer.rpc(
+                            "write",
+                            serde_json::json!({
+                                "sessionId": session_id,
+                                "data": String::from_utf8_lossy(&data),
+                            }),
+                        );
+                    }
+                })
+                .ok();
+            self.write_tx = Some(tx);
+        }
+        if let Some(tx) = &self.write_tx {
+            let _ = tx.send((session_id, data));
+        }
     }
 
     /// 取出 stream socket，交给后台 reader 线程。
