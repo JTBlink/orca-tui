@@ -97,9 +97,13 @@ client、stream reader、request router 和测试。不要仅依据旧文档中�
 完整 argv；空段丢弃。Normal 模式把输入转发给焦点 Agent，`Ctrl+Alt+P` 进入 Pane 模式，
 `Ctrl+Q` 为全局退出键。
 
-`App` 维护窗格、session、稳定 pane id 和 daemon session id 的并行关系。关闭或移动窗格时，
-必须按稳定 id 路由异步输出，不能把稳定 id 当作当前 Vec 下标。未知 daemon session id 应丢弃，
-不能默认注入第一个窗格。
+`App` 通过 `PaneSlot` 聚合单个窗格的终端状态、启动命令、编排任务、daemon session、重连、
+pin 和活动状态。Vec position 只承担布局与焦点索引；异步输出始终先用稳定 pane id 反查当前
+位置，不能把稳定 id 当作当前 Vec 下标。未知 daemon session id 应丢弃，不能默认注入第一个
+窗格。
+
+当前迁移阶段仍保留少量 session/reconnect 等兼容镜像，供旧调用方和回归测试使用；新代码应以
+`PaneSlot` 为 per-pane 状态入口，后续收缩阶段会删除这些镜像并移除 lockstep 约束。
 
 ## 配置与外部集成
 

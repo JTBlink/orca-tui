@@ -975,7 +975,9 @@ impl<B: Backend> App<B> {
                         }
                     }
                     let attempt = self
-                        .panes.get(pane_id).and_then(|slot| slot.reconnect.as_ref())
+                        .panes
+                        .get(pane_id)
+                        .and_then(|slot| slot.reconnect.as_ref())
                         .map(|rs| rs.attempts())
                         .unwrap_or(0);
                     if let Some(pane) = self.panes.get_mut(pane_id) {
@@ -983,7 +985,9 @@ impl<B: Backend> App<B> {
                             "reconnecting (attempt {attempt})…"
                         )));
                     }
-                    if let Some(slot) = self.sessions.get_mut(pane_id) { slot.take(); }
+                    if let Some(slot) = self.sessions.get_mut(pane_id) {
+                        slot.take();
+                    }
                     return;
                 }
                 if let Some(pane) = self.panes.get_mut(pane_id) {
@@ -1011,7 +1015,9 @@ impl<B: Backend> App<B> {
                 // gone. `Option::take` is idempotent: a second Exit for the
                 // same pane (forwarder None after reap Some) finds the slot
                 // already None and is a no-op.
-                if let Some(slot) = self.sessions.get_mut(pane_id) { slot.take(); }
+                if let Some(slot) = self.sessions.get_mut(pane_id) {
+                    slot.take();
+                }
                 // Feature 7: if this pane ran an orchestrated task, report its
                 // completion to the coordinator so dependent tasks can be
                 // dispatched on the next pump.
@@ -1200,9 +1206,10 @@ impl<B: Backend> App<B> {
                 let session_map: Arc<Mutex<HashMap<String, usize>>> =
                     Arc::new(Mutex::new(HashMap::new()));
                 for (i, pane) in self.panes.iter().enumerate() {
-                    let sid = pane.daemon_session_id.as_ref().or_else(|| {
-                        self.daemon_session_ids.get(i).and_then(|s| s.as_ref())
-                    });
+                    let sid = pane
+                        .daemon_session_id
+                        .as_ref()
+                        .or_else(|| self.daemon_session_ids.get(i).and_then(|s| s.as_ref()));
                     if let Some(sid) = sid {
                         session_map.lock().unwrap().insert(sid.clone(), pane.id());
                     }
@@ -1307,7 +1314,8 @@ impl<B: Backend> App<B> {
             .panes
             .get(i)
             .and_then(|slot| (!slot.command.is_empty()).then(|| slot.command.clone()))
-            .or_else(|| self.pane_command.get(i).cloned()) else {
+            .or_else(|| self.pane_command.get(i).cloned())
+        else {
             return;
         };
         // The pane already has a stable id — re-use it for the new forwarder
@@ -1348,11 +1356,22 @@ impl<B: Backend> App<B> {
         let now = Instant::now();
         // Collect indices due for respawn first to avoid borrow conflicts.
         let mut due: Vec<usize> = Vec::new();
-        for (i, slot) in self.reconnect.iter_mut().enumerate() {
-            let Some(rs) = slot.as_mut() else {
+        for i in 0..self.panes.len() {
+            let legacy = self.reconnect.get(i).and_then(|slot| slot.as_ref());
+            let Some(rs) = self
+                .panes
+                .get(i)
+                .and_then(|slot| slot.reconnect.as_ref())
+                .or(legacy)
+            else {
                 continue;
             };
-            let Some(&deadline) = self.reconnect_due.get(i).and_then(|o| o.as_ref()) else {
+            let deadline = self
+                .panes
+                .get(i)
+                .and_then(|slot| slot.reconnect_due)
+                .or_else(|| self.reconnect_due.get(i).copied().flatten());
+            let Some(deadline) = deadline else {
                 continue;
             };
             if now >= deadline {
@@ -1361,6 +1380,9 @@ impl<B: Backend> App<B> {
                     if let Some(d) = self.reconnect_due.get_mut(i) {
                         d.take();
                     }
+                    if let Some(slot) = self.panes.get_mut(i) {
+                        slot.reconnect_due = None;
+                    }
                 } else {
                     due.push(i);
                 }
@@ -1368,13 +1390,22 @@ impl<B: Backend> App<B> {
         }
         for i in due {
             // Respawn resets the attempt counter for the next drop.
+            if let Some(slot) = self.panes.get_mut(i) {
+                if let Some(rs) = slot.reconnect.as_mut() {
+                    rs.record_success();
+                }
+            }
             if let Some(slot) = self.reconnect.get_mut(i) {
                 if let Some(rs) = slot.as_mut() {
                     rs.record_success();
                 }
             }
-            if let Some(d) = self.reconnect_due.get_mut(i) { d.take(); }
-            if let Some(slot) = self.panes.get_mut(i) { slot.reconnect_due = None; }
+            if let Some(d) = self.reconnect_due.get_mut(i) {
+                d.take();
+            }
+            if let Some(slot) = self.panes.get_mut(i) {
+                slot.reconnect_due = None;
+            }
             self.respawn(i);
         }
     }
@@ -3364,8 +3395,11 @@ impl<B: Backend> App<B> {
                 .panes
                 .get(self.focus)
                 .and_then(|slot| slot.daemon_session_id.as_ref())
-                .or_else(|| self.daemon_session_ids.get(self.focus).and_then(|s| s.as_ref()))
-            {
+                .or_else(|| {
+                    self.daemon_session_ids
+                        .get(self.focus)
+                        .and_then(|s| s.as_ref())
+                }) {
                 Some(id) => id.clone(),
                 None => return, // no daemon session for this pane yet
             };
