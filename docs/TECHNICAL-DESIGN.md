@@ -106,6 +106,14 @@ pin 和活动状态。Vec position 只承担布局与焦点索引；异步输出
 reconnect、pin 或 status 的 parallel vectors。新增字段必须先归入 `PaneSlot`，Vec position
 只能作为布局和焦点索引。
 
+输入边界由 `input` 模块维护 `InputMode`、`FocusDirection` 和无副作用的
+`InputCommand` reducer。`App` 只执行语义命令；modal 文本状态仍在 App 中暂存，但不应在
+handler 内直接进行阻塞 I/O。
+
+渲染边界由 `render_model::RenderModel` 负责从 slot 派生 sidebar entries 与状态 tally，
+再交给 ratatui 绘制。daemon 控制面由 `daemon_connection::DaemonConnection` 包装，输入写入
+通过专用 writer 线程排队，避免 UI loop 等待 RPC。
+
 ## 配置与外部集成
 
 配置读取自 `$XDG_CONFIG_HOME/orcatui/config.toml`，否则为 `$HOME/.config/orcatui/config.toml`。

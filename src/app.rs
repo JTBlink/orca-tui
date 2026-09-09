@@ -1977,7 +1977,7 @@ impl<B: Backend> App<B> {
                 ])
                 .split(inner);
 
-                // Status → bucket mapping (see docs/ROADMAP.md Phase 2):
+                // Status → bucket mapping (see docs/TECHNICAL-DESIGN.md):
                 //   needs-attention = Blocked | Interrupted | Failed
                 //   working         = Working  | Waiting     | Idle
                 //   done            = Done
