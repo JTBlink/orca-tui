@@ -43,15 +43,6 @@ impl DaemonConnection {
         self.client.endpoint()
     }
 
-    /// 执行一个 JSON RPC。
-    pub(crate) fn rpc(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, DaemonError> {
-        self.client.rpc(method, params)
-    }
-
     /// 将输入排入专用 writer 线程，避免 UI loop 等待 daemon RPC 响应。
     pub(crate) fn enqueue_write(&mut self, session_id: String, data: Vec<u8>) {
         if self.write_tx.is_none() {

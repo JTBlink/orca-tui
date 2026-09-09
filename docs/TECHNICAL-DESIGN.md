@@ -103,7 +103,7 @@ pin 和活动状态。Vec position 只承担布局与焦点索引；异步输出
 窗格。
 
 所有 per-pane 生命周期字段均由 `PaneSlot` 唯一持有；App 不再维护 session、task、command、
-reconnect、pin 或 status 的 parallel vectors。新增字段必须先归入 `PaneSlot`，Vec position
+reconnect、pin 或 status 的平行状态字段。新增字段必须先归入 `PaneSlot`，Vec position
 只能作为布局和焦点索引。
 
 输入边界由 `input` 模块维护 `InputMode`、`FocusDirection`、`InteractionState` 和无副作用的

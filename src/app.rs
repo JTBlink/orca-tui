@@ -2599,10 +2599,8 @@ impl<B: Backend> App<B> {
             .collect()
     }
 
-    /// Phase 2 — Tasks view: repo-input modal key handling. Type `owner/name`,
-    /// Enter parses + fetches open issues + PRs (synchronously for v1; the gh
-    /// CLI is sub-second so this is acceptable — async background fetch is a
-    /// documented follow-up), Backspace deletes, Esc cancels.
+    /// Tasks view repo-input modal. Enter parses `owner/name` and starts the
+    /// issue/PR query on a background worker; Backspace deletes and Esc cancels.
     fn handle_tasks_repo_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
