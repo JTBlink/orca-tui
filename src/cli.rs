@@ -225,34 +225,7 @@ fn try_main(cli: Cli) -> Result<()> {
                 cwd
             };
 
-            // `trailing_var_arg` does not reliably enforce a minimum, so guard
-            // explicitly: at least one non-empty agent command is required.
-            let commands = split_agents(command);
-            if commands.is_empty() {
-                anyhow::bail!(
-                    "no agent command given — usage: \
-                     orcatui run [--cwd <DIR>] [--worktree] [--remote <HOST>] -- <command>...  \
-                     (separate per-agent commands with '::')"
-                );
-            }
-
-            // Each command vector is its own agent (its own pane + PTY). To
-            // pass extra args to a single agent, either group tokens with `::`
-            // or wrap them in `sh -c`.
-            let mut specs: Vec<AgentSpec> =
-                commands.into_iter().map(AgentSpec::from_command).collect();
-
-            // Feature 8: wrap each agent command for remote execution over SSH.
-            if let Some(host) = &remote {
-                let target = SshTarget::parse(host)
-                    .with_context(|| format!("parsing --remote host {host:?}"))?;
-                for spec in &mut specs {
-                    spec.command = target
-                        .clone()
-                        .with_command(spec.command.clone())
-                        .command_vec();
-                }
-            }
+            let specs = prepare_run_specs(command, remote.as_deref())?;
 
             let mut app = App::spawn_agents(specs, cwd.as_deref(), worktree)?;
 
@@ -436,6 +409,29 @@ fn try_main(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// 将 CLI 的命令参数转换为 pane 启动规格。
+///
+/// 该函数把参数解析与 App 启动解耦，保证普通命令和 SSH 远程命令共享
+/// 同一套 `::` 分段语义，也便于在不触碰终端的单元测试中验证 dispatch。
+fn prepare_run_specs(command: Vec<String>, remote: Option<&str>) -> Result<Vec<AgentSpec>> {
+    let commands = split_agents(command);
+    if commands.is_empty() {
+        anyhow::bail!("no agent command given — usage: orcatui run -- <command>...");
+    }
+    let mut specs: Vec<AgentSpec> = commands.into_iter().map(AgentSpec::from_command).collect();
+    if let Some(host) = remote {
+        let target =
+            SshTarget::parse(host).with_context(|| format!("parsing --remote host {host:?}"))?;
+        for spec in &mut specs {
+            spec.command = target
+                .clone()
+                .with_command(spec.command.clone())
+                .command_vec();
+        }
+    }
+    Ok(specs)
 }
 
 /// Install a SIGTERM handler that sets the atomic shutdown flag.
@@ -745,6 +741,20 @@ mod tests {
     fn split_agents_only_separators_yields_nothing() {
         let got = split_agents(vec!["::".into(), "::".into(), "::".into()]);
         assert!(got.is_empty(), "all-empty segments must be dropped");
+    }
+
+    #[test]
+    fn prepare_run_specs_rejects_empty_commands() {
+        let err = prepare_run_specs(vec!["::".into()], None).unwrap_err();
+        assert!(err.to_string().contains("no agent command"));
+    }
+
+    #[test]
+    fn prepare_run_specs_wraps_remote_commands() {
+        let specs = prepare_run_specs(vec!["echo".into()], Some("example.com")).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].command.first().map(String::as_str), Some("ssh"));
+        assert!(specs[0].command.iter().any(|arg| arg == "example.com"));
     }
 
     /// End-to-end check of the spec-building path: splitting + the empty guard.
