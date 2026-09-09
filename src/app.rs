@@ -2000,25 +2000,18 @@ impl<B: Backend> App<B> {
             }
             // Activity timeline overlay (drawn on top, any key to close).
             if activity_open {
-                use ratatui::widgets::{Block, BorderType, Borders, Clear};
                 let pop = Rect::new(
                     total.x + 2,
                     total.y + 1,
                     total.width.saturating_sub(4).max(40),
                     total.height.saturating_sub(2).max(10),
                 );
-                f.render_widget(Clear, pop);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .style(Style::default().bg(theme.panel()))
-                    .border_style(Style::default().fg(theme.accent()))
-                    .title(
-                        Line::from(" Activity (any key to close) ")
-                            .style(Style::default().fg(theme.accent())),
-                    );
-                f.render_widget(&block, pop);
-                let inner = block.inner(pop);
+                let inner = crate::overlay::begin_popup(
+                    f,
+                    pop,
+                    Line::from(" Activity (any key to close) "),
+                    theme,
+                );
                 // `activity_lines` is newest-first (recent() returns newest-first),
                 // so the most recent transition renders at the top.
                 let lines: Vec<Line> = if render_model.overlay.activity_lines.is_empty() {
@@ -2041,25 +2034,18 @@ impl<B: Backend> App<B> {
             // grouping the live per-pane statuses into needs-attention /
             // working / done columns. Any key dismisses it back to Normal.
             if dashboard_open {
-                use ratatui::widgets::{Block, BorderType, Borders, Clear};
                 let pop = Rect::new(
                     total.x + 2,
                     total.y + 1,
                     total.width.saturating_sub(4).max(40),
                     total.height.saturating_sub(2).max(10),
                 );
-                f.render_widget(Clear, pop);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .style(Style::default().bg(theme.panel()))
-                    .border_style(Style::default().fg(theme.accent()))
-                    .title(
-                        Line::from(" Agent Dashboard (any key to close) ")
-                            .style(Style::default().fg(theme.accent())),
-                    );
-                f.render_widget(&block, pop);
-                let inner = block.inner(pop);
+                let inner = crate::overlay::begin_popup(
+                    f,
+                    pop,
+                    Line::from(" Agent Dashboard (any key to close) "),
+                    theme,
+                );
                 // Split the inner area into 3 equal columns. Using Min(1) × 3
                 // fills evenly regardless of odd widths (ratatui distributes any
                 // remainder rather than leaving a gap).
@@ -2118,22 +2104,13 @@ impl<B: Backend> App<B> {
             // Settings. All three are wired in Phase 1/2 — no placeholders remain.
             if sidebar_open {
                 use ratatui::style::Modifier;
-                use ratatui::widgets::{Block, BorderType, Borders, Clear};
                 let n = SIDEBAR_NAV_ITEMS.len();
                 let pop_h = (n as u16 + 3).min(total.height.saturating_sub(4)).max(5);
                 let pop_w = total.width.min(36).max(24);
                 let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
                 let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
                 let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
-                f.render_widget(Clear, pop);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .style(Style::default().bg(theme.panel()))
-                    .border_style(Style::default().fg(theme.accent()))
-                    .title(Line::from(" Navigate ").style(Style::default().fg(theme.accent())));
-                f.render_widget(&block, pop);
-                let inner = block.inner(pop);
+                let inner = crate::overlay::begin_popup(f, pop, Line::from(" Navigate "), theme);
                 let mut lines: Vec<Line> = Vec::new();
                 for (i, name) in SIDEBAR_NAV_ITEMS.iter().enumerate() {
                     let selected = i == sidebar_selected;
@@ -2162,25 +2139,18 @@ impl<B: Backend> App<B> {
             }
             // Help overlay: full-screen keybindings reference.
             if show_help {
-                use ratatui::widgets::{Block, BorderType, Borders, Clear};
                 let pop = Rect::new(
                     total.x + 2,
                     total.y + 1,
                     total.width.saturating_sub(4).max(40),
                     total.height.saturating_sub(2).max(10),
                 );
-                f.render_widget(Clear, pop);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .style(Style::default().bg(theme.panel()))
-                    .border_style(Style::default().fg(theme.accent()))
-                    .title(
-                        Line::from(" Keybindings (any key to close) ")
-                            .style(Style::default().fg(theme.accent())),
-                    );
-                f.render_widget(&block, pop);
-                let inner = block.inner(pop);
+                let inner = crate::overlay::begin_popup(
+                    f,
+                    pop,
+                    Line::from(" Keybindings (any key to close) "),
+                    theme,
+                );
 
                 let help_lines = vec![
                     Line::from(vec![Span::styled(
@@ -2239,23 +2209,13 @@ impl<B: Backend> App<B> {
             // picker, mirroring the jump palette's centered box style).
             if custom_open {
                 use ratatui::style::Modifier;
-                use ratatui::widgets::{Block, BorderType, Borders, Clear};
                 let pop_w = total.width.min(60).max(40);
                 let pop_h = 5u16;
                 let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
                 let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
                 let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
-                f.render_widget(Clear, pop);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme.accent()))
-                    .style(Style::default().bg(theme.panel()))
-                    .title(
-                        Line::from(" Custom command ").style(Style::default().fg(theme.accent())),
-                    );
-                f.render_widget(&block, pop);
-                let inner = block.inner(pop);
+                let inner =
+                    crate::overlay::begin_popup(f, pop, Line::from(" Custom command "), theme);
                 let line = Line::from(vec![
                     Span::styled("> ", Style::default().fg(theme.accent()).bg(theme.panel())),
                     Span::styled(
@@ -2279,24 +2239,17 @@ impl<B: Backend> App<B> {
             // modal shape: a centered single-line text entry with a block cursor.
             if tasks_repo_open {
                 use ratatui::style::Modifier;
-                use ratatui::widgets::{Block, BorderType, Borders, Clear};
                 let pop_w = total.width.min(60).max(40);
                 let pop_h = 5u16;
                 let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
                 let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
                 let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
-                f.render_widget(Clear, pop);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme.accent()))
-                    .style(Style::default().bg(theme.panel()))
-                    .title(
-                        Line::from(" Tasks \u{2014} owner/name ")
-                            .style(Style::default().fg(theme.accent())),
-                    );
-                f.render_widget(&block, pop);
-                let inner = block.inner(pop);
+                let inner = crate::overlay::begin_popup(
+                    f,
+                    pop,
+                    Line::from(" Tasks \u{2014} owner/name "),
+                    theme,
+                );
                 let line = Line::from(vec![
                     Span::styled("> ", Style::default().fg(theme.accent()).bg(theme.panel())),
                     Span::styled(
@@ -2321,7 +2274,6 @@ impl<B: Backend> App<B> {
             // indicator, or an error message when the fetch failed.
             if tasks_list_open {
                 use ratatui::style::Modifier;
-                use ratatui::widgets::{Block, BorderType, Borders, Clear};
                 let n = render_model.overlay.tasks_items.len();
                 // ~3 items per 12 rows of terminal height, clamped to [2, 8].
                 let max_visible = ((total.height / 12) as usize).clamp(2, 8);
@@ -2338,19 +2290,11 @@ impl<B: Backend> App<B> {
                 let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
                 let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
                 let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
-                f.render_widget(Clear, pop);
                 let title = match &render_model.overlay.tasks_error {
                     Some(_) => " Tasks \u{2014} error ",
                     None => " Tasks \u{2014} open issues + PRs ",
                 };
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .style(Style::default().bg(theme.panel()))
-                    .border_style(Style::default().fg(theme.accent()))
-                    .title(Line::from(title).style(Style::default().fg(theme.accent())));
-                f.render_widget(&block, pop);
-                let inner = block.inner(pop);
+                let inner = crate::overlay::begin_popup(f, pop, Line::from(title), theme);
 
                 let mut lines: Vec<Line> = Vec::new();
                 if let Some(err) = &render_model.overlay.tasks_error {
@@ -2420,7 +2364,6 @@ impl<B: Backend> App<B> {
             // this render just reflects the current values.
             if settings_open {
                 use ratatui::style::Modifier;
-                use ratatui::widgets::{Block, BorderType, Borders, Clear};
                 let rows = [
                     ("Sidebar", if settings_sidebar_on { "on" } else { "off" }),
                     ("Status bar", if settings_status_bar { "on" } else { "off" }),
@@ -2434,15 +2377,7 @@ impl<B: Backend> App<B> {
                 let pop_x = total.x + (total.width.saturating_sub(pop_w)) / 2;
                 let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
                 let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
-                f.render_widget(Clear, pop);
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .style(Style::default().bg(theme.panel()))
-                    .border_style(Style::default().fg(theme.accent()))
-                    .title(Line::from(" Settings ").style(Style::default().fg(theme.accent())));
-                f.render_widget(&block, pop);
-                let inner = block.inner(pop);
+                let inner = crate::overlay::begin_popup(f, pop, Line::from(" Settings "), theme);
 
                 let mut lines: Vec<Line> = Vec::new();
                 for (i, (label, value)) in rows.iter().enumerate() {
