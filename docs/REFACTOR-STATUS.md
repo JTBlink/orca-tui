@@ -13,6 +13,8 @@
 - GitHub Tasks 列表和 daemon 写入不再阻塞 UI loop。
 - daemon 动态 `createOrAttach` 通过独立 worker 完成，UI 先展示占位 pane，再以非阻塞轮询
   应用成功快照或错误状态。
+- CLI 已将默认命令解析与顶层子命令 dispatch 分离；各子命令的具体启动逻辑仍在逐步下沉到
+  独立入口函数。
 
 ## 验证命令
 
