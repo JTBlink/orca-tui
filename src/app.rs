@@ -1803,7 +1803,17 @@ impl<B: Backend> App<B> {
             tasks_repo_input: tasks_repo_input_view.clone(),
             tasks_items: tasks_items_view
                 .iter()
-                .map(|entry| (entry.title.clone(), entry.number.to_string()))
+                .map(|entry| {
+                    let kind = match entry.kind {
+                        TaskKind::Issue => "issue",
+                        TaskKind::PullRequest => "pr",
+                    };
+                    (
+                        kind.to_string(),
+                        entry.title.clone(),
+                        entry.number.to_string(),
+                    )
+                })
                 .collect(),
             tasks_selected: tasks_selected_view,
             tasks_error: tasks_error_view.clone(),
@@ -2374,10 +2384,14 @@ impl<B: Backend> App<B> {
             if tasks_list_open {
                 use ratatui::style::Modifier;
                 use ratatui::widgets::{Block, BorderType, Borders, Clear};
-                let n = tasks_items_view.len();
+                let n = render_model.overlay.tasks_items.len();
                 // ~3 items per 12 rows of terminal height, clamped to [2, 8].
                 let max_visible = ((total.height / 12) as usize).clamp(2, 8);
-                let body_rows = if tasks_error_view.is_some() { 3 } else { n };
+                let body_rows = if render_model.overlay.tasks_error.is_some() {
+                    3
+                } else {
+                    n
+                };
                 let visible = body_rows.min(max_visible);
                 let pop_h = (visible as u16 + 3)
                     .min(total.height.saturating_sub(4))
@@ -2387,7 +2401,7 @@ impl<B: Backend> App<B> {
                 let pop_y = total.y + (total.height.saturating_sub(pop_h)) / 2;
                 let pop = Rect::new(pop_x, pop_y, pop_w, pop_h);
                 f.render_widget(Clear, pop);
-                let title = match &tasks_error_view {
+                let title = match &render_model.overlay.tasks_error {
                     Some(_) => " Tasks \u{2014} error ",
                     None => " Tasks \u{2014} open issues + PRs ",
                 };
@@ -2401,7 +2415,7 @@ impl<B: Backend> App<B> {
                 let inner = block.inner(pop);
 
                 let mut lines: Vec<Line> = Vec::new();
-                if let Some(err) = &tasks_error_view {
+                if let Some(err) = &render_model.overlay.tasks_error {
                     // Fetch failure: show the error + an Esc hint, no list.
                     lines.push(Line::from(err.as_str()).style(Style::default().fg(theme.error())));
                     lines.push(Line::default());
@@ -2411,14 +2425,19 @@ impl<B: Backend> App<B> {
                 } else {
                     // Scroll offset: keep the selected item visible (spawn-picker
                     // pattern).
-                    let scroll = tasks_selected_view.saturating_sub(max_visible.saturating_sub(1));
-                    for (i, entry) in tasks_items_view
+                    let scroll = render_model
+                        .overlay
+                        .tasks_selected
+                        .saturating_sub(max_visible.saturating_sub(1));
+                    for (i, (tag, title, number)) in render_model
+                        .overlay
+                        .tasks_items
                         .iter()
                         .enumerate()
                         .skip(scroll)
                         .take(usize::from(inner.height))
                     {
-                        let selected = i == tasks_selected_view;
+                        let selected = i == render_model.overlay.tasks_selected;
                         let style = if selected {
                             Style::default()
                                 .fg(theme.accent())
@@ -2427,24 +2446,17 @@ impl<B: Backend> App<B> {
                             Style::default().fg(theme.fg())
                         };
                         let prefix = if selected { "▶ " } else { "  " };
-                        let tag = match entry.kind {
-                            TaskKind::Issue => "issue",
-                            TaskKind::PullRequest => "pr",
-                        };
                         // `▶ #NNN title  [issue|pr]` — tag right-aligned-ish by
                         // a fixed 2-space gap (titles vary in width).
                         lines.push(
-                            Line::from(format!(
-                                "{prefix}#{:<4} {}  [{tag}]",
-                                entry.number, entry.title
-                            ))
-                            .style(style),
+                            Line::from(format!("{prefix}#{:<4} {}  [{tag}]", number, title))
+                                .style(style),
                         );
                     }
                     // Scroll indicator (only when there are more items than
                     // visible and no error).
                     if n > max_visible {
-                        let more_below = tasks_selected_view + 1 < n;
+                        let more_below = render_model.overlay.tasks_selected + 1 < n;
                         let more_above = scroll > 0;
                         let indicator = match (more_above, more_below) {
                             (true, true) => " \u{2191}\u{2193} more ",

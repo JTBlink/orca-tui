@@ -30,7 +30,7 @@ pub(crate) struct OverlayModel {
     pub(crate) activity_lines: Vec<String>,
     pub(crate) sidebar_selected: usize,
     pub(crate) tasks_repo_input: String,
-    pub(crate) tasks_items: Vec<(String, String)>,
+    pub(crate) tasks_items: Vec<(String, String, String)>,
     pub(crate) tasks_selected: usize,
     pub(crate) tasks_error: Option<String>,
     pub(crate) settings_cursor: usize,
