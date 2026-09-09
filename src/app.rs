@@ -3839,6 +3839,22 @@ mod tests {
     }
 
     #[test]
+    fn daemon_spawn_worker_disconnect_marks_placeholder_failed() {
+        let mut app = App::for_test(vec![pane(7, "pending")]);
+        let (tx, rx) = std::sync::mpsc::channel::<
+            Result<serde_json::Value, crate::orca_daemon::DaemonError>,
+        >();
+        drop(tx);
+        app.daemon_spawn_rx.push((7, "session-7".into(), rx));
+
+        assert!(app.pump_daemon_spawns());
+        assert!(app.daemon_spawn_rx.is_empty());
+        assert!(
+            matches!(app.panes[0].state(), AgentState::Failed(reason) if reason.contains("worker stopped"))
+        );
+    }
+
+    #[test]
     fn handle_key_mode_switch_ctrl_q_quit_and_pane_focus() {
         let mut app = App::for_test(vec![pane(0, "a"), pane(1, "b")]);
         assert_eq!(app.mode, InputMode::Normal);
