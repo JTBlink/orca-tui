@@ -51,3 +51,17 @@ Commit 标题应简短、使用祈使语气，并带有 `feat:`、`fix:` 或 `do
 
 绝不要提交 daemon token、GitHub 凭据、SSH 私钥、包含隐私数据的录制文件或机器专用配置。提交
 前检查 `git diff` 和 `git status`，并将生成的录制文件与本地配置排除在仓库之外。
+
+## Agent skills
+
+### Issue tracker
+
+本仓库的 issue 和 spec 使用 GitHub Issues 管理，统一使用 `gh` CLI。详见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+使用默认标签：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`。详见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+这是 single-context 仓库。相关工作开始前读取根目录 `CONTEXT.md`（若存在）和 `docs/adr/` 下相关 ADR。详见 `docs/agents/domain.md`。

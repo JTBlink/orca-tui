@@ -1230,10 +1230,14 @@ impl<B: Backend> App<B> {
                                         match frame.ftype {
                                             FrameType::Data => {
                                                 // Parse NDJSON {sessionId, data} or treat as raw for pane 0.
-                                                let (pane_id, bytes) =
-                                                    parse_stream_data(&frame.payload, &map);
-                                                let _ =
-                                                    tx.send(AgentUpdate::Output { pane_id, bytes });
+                                                if let Some((pane_id, bytes)) =
+                                                    parse_stream_data(&frame.payload, &map)
+                                                {
+                                                    let _ = tx.send(AgentUpdate::Output {
+                                                        pane_id,
+                                                        bytes,
+                                                    });
+                                                }
                                             }
                                             FrameType::Event => {
                                                 // Parse NDJSON event (exit, etc.).
@@ -1430,9 +1434,12 @@ impl<B: Backend> App<B> {
                                 match DaemonClient::read_stream_frame(&mut stream) {
                                     Ok(frame) => match frame.ftype {
                                         FrameType::Data => {
-                                            let (pane_id, bytes) =
-                                                parse_stream_data(&frame.payload, &map);
-                                            let _ = tx.send(AgentUpdate::Output { pane_id, bytes });
+                                            if let Some((pane_id, bytes)) =
+                                                parse_stream_data(&frame.payload, &map)
+                                            {
+                                                let _ =
+                                                    tx.send(AgentUpdate::Output { pane_id, bytes });
+                                            }
                                         }
                                         FrameType::Event => {
                                             if let Some((pane_id, code)) =
@@ -1581,7 +1588,18 @@ impl<B: Backend> App<B> {
         // Cache the OUTER pane rects so handle_mouse can hit-test against the
         // exact panes that were last drawn (before the borrow-holding draw
         // closure below).
-        self.pane_rects = rects.clone();
+        // In zoom mode `rects` contains only the visible focused pane. Keep a
+        // position-aligned cache for mouse hit-testing so the visible region
+        // resolves to the focused pane rather than implicitly becoming pane 0.
+        self.pane_rects = if zoomed {
+            let mut cached = vec![Rect::default(); self.panes.len()];
+            if let Some(slot) = cached.get_mut(self.focus) {
+                *slot = pane_area;
+            }
+            cached
+        } else {
+            rects.clone()
+        };
 
         for (i, pane) in self.panes.iter_mut().enumerate() {
             // In zoom mode, skip all panes except the focused one.
@@ -3404,24 +3422,25 @@ impl<B: Backend> App<B> {
 
 /// Parse a Data-frame payload and route it to the correct pane.
 ///
-/// The daemon sends NDJSON `{"sessionId":"...","data":"..."}`. If the payload
-/// doesn't parse as NDJSON (e.g. raw bytes), fall back to pane 0.
+/// The daemon sends NDJSON `{"sessionId":"...","data":"..."}`. A payload
+/// carrying an unknown session ID is dropped; only payloads with no session ID
+/// use the legacy raw-bytes fallback to pane 0.
 fn parse_stream_data(
     payload: &[u8],
     session_map: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
-) -> (usize, Vec<u8>) {
+) -> Option<(usize, Vec<u8>)> {
     // Try NDJSON first.
     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(payload) {
         if let Some(sid) = json.get("sessionId").and_then(|v| v.as_str()) {
-            let pane_id = session_map.lock().unwrap().get(sid).copied().unwrap_or(0);
+            let pane_id = session_map.lock().unwrap().get(sid).copied()?;
             if let Some(data) = json.get("data").and_then(|v| v.as_str()) {
-                return (pane_id, data.as_bytes().to_vec());
+                return Some((pane_id, data.as_bytes().to_vec()));
             }
-            return (pane_id, Vec::new());
+            return Some((pane_id, Vec::new()));
         }
     }
-    // Fallback: raw bytes → pane 0.
-    (0, payload.to_vec())
+    // Compatibility path: raw bytes (or JSON without a session ID) → pane 0.
+    Some((0, payload.to_vec()))
 }
 
 /// Parse an Event-frame payload for an exit event.
@@ -3437,7 +3456,7 @@ fn parse_stream_event(
         return None;
     }
     let sid = json.get("sessionId").and_then(|v| v.as_str())?;
-    let pane_id = session_map.lock().unwrap().get(sid).copied().unwrap_or(0);
+    let pane_id = session_map.lock().unwrap().get(sid).copied()?;
     let code = json
         .get("payload")
         .and_then(|p| p.get("code"))
@@ -4687,7 +4706,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_stream_data_routes_ndjson_and_falls_back_to_pane_zero() {
+    fn parse_stream_data_routes_known_sessions_and_drops_unknown_sessions() {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
         let mut m = HashMap::new();
@@ -4695,21 +4714,25 @@ mod tests {
         let map = Arc::new(Mutex::new(m));
 
         let (pane, bytes) =
-            super::parse_stream_data(br#"{"sessionId":"sess-1","data":"hello"}"#, &map);
+            super::parse_stream_data(br#"{"sessionId":"sess-1","data":"hello"}"#, &map)
+                .expect("known session routes");
         assert_eq!(pane, 2, "known session routes to its pane");
         assert_eq!(bytes, b"hello", "data field extracted as bytes");
 
-        let (pane, bytes) = super::parse_stream_data(br#"{"sessionId":"sess-9","data":"x"}"#, &map);
-        assert_eq!(pane, 0, "unknown session falls back to pane 0");
-        assert_eq!(bytes, b"x");
+        assert!(
+            super::parse_stream_data(br#"{"sessionId":"sess-9","data":"x"}"#, &map).is_none(),
+            "unknown session must be dropped rather than routed to pane 0"
+        );
 
         // JSON without a sessionId → pane 0 with the raw payload.
-        let (pane, bytes) = super::parse_stream_data(br#"{"data":"y"}"#, &map);
+        let (pane, bytes) = super::parse_stream_data(br#"{"data":"y"}"#, &map)
+            .expect("payload without session id uses raw compatibility path");
         assert_eq!(pane, 0);
         assert_eq!(bytes, br#"{"data":"y"}"#, "raw payload returned verbatim");
 
         // Non-JSON bytes → pane 0 with the payload verbatim.
-        let (pane, bytes) = super::parse_stream_data(b"raw-bytes", &map);
+        let (pane, bytes) = super::parse_stream_data(b"raw-bytes", &map)
+            .expect("raw payload uses compatibility path");
         assert_eq!(pane, 0);
         assert_eq!(bytes, b"raw-bytes");
     }
@@ -4735,8 +4758,8 @@ mod tests {
                 br#"{"event":"exit","sessionId":"ghost","payload":{"code":7}}"#,
                 &map,
             ),
-            Some((0, 7)),
-            "unknown session → pane 0"
+            None,
+            "unknown session is dropped"
         );
         assert_eq!(
             super::parse_stream_event(br#"{"event":"data","sessionId":"sess-1"}"#, &map),
@@ -5335,6 +5358,26 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
         assert!(!app.zoomed);
         app.render().expect("render unzoomed");
+    }
+
+    #[test]
+    fn zoomed_mouse_hit_testing_targets_focused_pane() {
+        let mut app = App::for_test(vec![pane(0, "alpha"), pane(1, "beta")]);
+        app.focus = 1;
+        app.zoomed = true;
+        app.render().expect("render zoomed panes");
+
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            // The default test config shows the sidebar, so the zoomed pane
+            // begins to the right of its reserved column.
+            column: 30,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.focus, 1, "zoomed click keeps the focused pane");
+        assert_eq!(app.drag_origin.map(|origin| origin.0), Some(1));
     }
 
     /// Assert every parallel per-pane Vec on `App` is exactly `panes.len()`
