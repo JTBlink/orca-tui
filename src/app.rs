@@ -286,6 +286,8 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// When `Some`, the [`InputMode::TasksList`] overlay shows the error
     /// message + "press Esc" instead of the item list.
     tasks_error: Option<String>,
+    /// GitHub task-list fetch running off the UI thread.
+    tasks_fetch_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<Vec<TasksEntry>>>>,
     /// Phase 2 — Settings overlay: the focused row index (0..=3). 0 = Sidebar,
     /// 1 = Status bar, 2 = Default agent, 3 = Theme. Drives the ▶ cursor in
     /// [`InputMode::Settings`].
@@ -458,6 +460,7 @@ impl App {
             tasks_items: Vec::new(),
             tasks_selected: 0,
             tasks_error: None,
+            tasks_fetch_rx: None,
             settings_cursor: 0,
         })
     }
@@ -573,6 +576,7 @@ impl<B: Backend> App<B> {
             // clobbered by) the forwarder's less-informed `Exit{None}`.
             self.reap_exited();
             let had_output = self.drain_bus();
+            let task_fetch_completed = self.poll_tasks_fetch();
             // After all updates (reap + bus drain) have landed on the panes,
             // capture any lifecycle/state transitions into the activity log.
             self.record_activity();
@@ -580,7 +584,7 @@ impl<B: Backend> App<B> {
             let now = Instant::now();
             // Fresh agent output counts as activity (keeps the scheduler out of
             // idle backoff while agents are producing).
-            if had_output {
+            if had_output || task_fetch_completed {
                 self.scheduler.record_activity(now);
             }
 
@@ -682,6 +686,30 @@ impl<B: Backend> App<B> {
             any = true;
         }
         any
+    }
+
+    /// 非阻塞地收取后台 GitHub 查询结果，避免 UI loop 被 `gh` 命令阻塞。
+    fn poll_tasks_fetch(&mut self) -> bool {
+        let Some(rx) = self.tasks_fetch_rx.as_ref() else {
+            return false;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return false;
+        };
+        self.tasks_fetch_rx = None;
+        match result {
+            Ok(items) => {
+                self.tasks_items = items;
+                self.tasks_selected = 0;
+                self.tasks_error = None;
+            }
+            Err(error) => {
+                self.tasks_items.clear();
+                self.tasks_selected = 0;
+                self.tasks_error = Some(format!("{error:#}"));
+            }
+        }
+        true
     }
 
     /// Capture agent lifecycle transitions (and the error message when an agent
@@ -2635,26 +2663,19 @@ impl<B: Backend> App<B> {
                 match RepoRef::parse(&self.tasks_repo_input) {
                     Ok(repo) => {
                         self.tasks_repo = Some(repo.clone());
-                        // v1: synchronous fetch. gh is sub-second; a background
-                        // async fetch (tokio task + event-channel redraw) is a
-                        // follow-up noted in docs/ROADMAP.md §2.
-                        let res = self.fetch_tasks(&repo);
-                        match res {
-                            Ok(items) => {
-                                self.tasks_items = items;
-                                self.tasks_selected = 0;
-                                self.tasks_error = None;
-                                self.mode = InputMode::TasksList;
-                            }
-                            Err(e) => {
-                                // Fetch failed: switch to the list overlay
-                                // anyway, which renders the error + Esc hint.
-                                self.tasks_items = Vec::new();
-                                self.tasks_selected = 0;
-                                self.tasks_error = Some(format!("{e:#}"));
-                                self.mode = InputMode::TasksList;
-                            }
-                        }
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        self.tasks_fetch_rx = Some(rx);
+                        self.tasks_items.clear();
+                        self.tasks_selected = 0;
+                        self.tasks_error = Some("正在获取任务…".to_string());
+                        self.mode = InputMode::TasksList;
+                        std::thread::Builder::new()
+                            .name("orca-gh-tasks".into())
+                            .spawn(move || {
+                                let result = Self::fetch_tasks_blocking(&repo);
+                                let _ = tx.send(result);
+                            })
+                            .ok();
                     }
                     Err(e) => {
                         self.tasks_error = Some(format!("{e:#}"));
@@ -2674,7 +2695,7 @@ impl<B: Backend> App<B> {
     /// into a single [`Vec<TasksEntry>`] sorted by number ascending. Issues
     /// store a title-only prompt initially (body is fetched lazily on
     /// dispatch); PRs store the final `pr_to_prompt` form.
-    fn fetch_tasks(&self, repo: &RepoRef) -> anyhow::Result<Vec<TasksEntry>> {
+    fn fetch_tasks_blocking(repo: &RepoRef) -> anyhow::Result<Vec<TasksEntry>> {
         use crate::integrations::{issue_to_prompt, list_issues, list_pull_requests, pr_to_prompt};
         let mut items: Vec<TasksEntry> = Vec::new();
         // Issues — body is None from the list endpoint; the issue_to_prompt
@@ -3467,6 +3488,7 @@ mod tests {
                 tasks_items: Vec::new(),
                 tasks_selected: 0,
                 tasks_error: None,
+                tasks_fetch_rx: None,
                 settings_cursor: 0,
             }
         }
@@ -3856,6 +3878,25 @@ mod tests {
         assert_eq!(app.tasks_selected, 0, "selection reset on open");
         assert!(app.tasks_error.is_none(), "error cleared on open");
         assert!(app.toasts.is_empty(), "no toast for an implemented feature");
+    }
+
+    #[test]
+    fn background_task_fetch_result_is_applied_without_blocking() {
+        let mut app = App::for_test(vec![pane(0, "a")]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.tasks_fetch_rx = Some(rx);
+        tx.send(Ok(vec![TasksEntry {
+            kind: TaskKind::Issue,
+            number: 7,
+            title: "后台结果".into(),
+            prompt: "prompt".into(),
+        }]))
+        .unwrap();
+
+        assert!(app.poll_tasks_fetch());
+        assert_eq!(app.tasks_items.len(), 1);
+        assert_eq!(app.tasks_items[0].number, 7);
+        assert!(app.tasks_fetch_rx.is_none());
     }
 
     #[test]
