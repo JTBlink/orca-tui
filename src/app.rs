@@ -1929,10 +1929,7 @@ impl<B: Backend> App<B> {
                     let prefix = if selected { "▶ " } else { "  " };
                     lines.push(Line::from(format!("{prefix}{name}")).style(style));
                 }
-                f.render_widget(
-                    Paragraph::new(lines).style(Style::default().bg(theme.panel())),
-                    inner,
-                );
+                crate::overlay::render_lines(f, inner, lines, theme);
             }
             // Spawn picker overlay (drawn on top, like the jump palette).
             if spawn_open {
@@ -1993,10 +1990,7 @@ impl<B: Backend> App<B> {
                         lines.push(Line::from(indicator).style(Style::default().fg(theme.muted())));
                     }
                 }
-                f.render_widget(
-                    Paragraph::new(lines).style(Style::default().bg(theme.panel())),
-                    inner,
-                );
+                crate::overlay::render_lines(f, inner, lines, theme);
             }
             // Activity timeline overlay (drawn on top, any key to close).
             if activity_open {
@@ -2025,10 +2019,7 @@ impl<B: Backend> App<B> {
                         .map(|s| Line::from(s.as_str()).style(Style::default().fg(theme.fg())))
                         .collect()
                 };
-                f.render_widget(
-                    Paragraph::new(lines).style(Style::default().bg(theme.panel())),
-                    inner,
-                );
+                crate::overlay::render_lines(f, inner, lines, theme);
             }
             // Agent dashboard overlay (Phase 2): a read-only 3-bucket board
             // grouping the live per-pane statuses into needs-attention /
@@ -2094,10 +2085,7 @@ impl<B: Backend> App<B> {
                             lines.push(Line::from(*name).style(Style::default().fg(theme.fg())));
                         }
                     }
-                    f.render_widget(
-                        Paragraph::new(lines).style(Style::default().bg(theme.panel())),
-                        cols[i],
-                    );
+                    crate::overlay::render_lines(f, cols[i], lines, theme);
                 }
             }
             // Sidebar nav popup (Ctrl+S / `s` in Pane mode): Activity / Tasks /
@@ -2132,10 +2120,7 @@ impl<B: Backend> App<B> {
                     };
                     lines.push(Line::from(label).style(style));
                 }
-                f.render_widget(
-                    Paragraph::new(lines).style(Style::default().bg(theme.panel())),
-                    inner,
-                );
+                crate::overlay::render_lines(f, inner, lines, theme);
             }
             // Help overlay: full-screen keybindings reference.
             if show_help {
@@ -2353,10 +2338,7 @@ impl<B: Backend> App<B> {
                         }
                     }
                 }
-                f.render_widget(
-                    Paragraph::new(lines).style(Style::default().bg(theme.panel())),
-                    inner,
-                );
+                crate::overlay::render_lines(f, inner, lines, theme);
             }
             // Settings overlay (Phase 2): four toggle/cycle rows. Mirrors the
             // spawn-picker shape — a centered rounded box with a ▶ cursor.
@@ -2392,10 +2374,7 @@ impl<B: Backend> App<B> {
                     };
                     lines.push(Line::from(format!("{prefix}{label}: {value}")).style(style));
                 }
-                f.render_widget(
-                    Paragraph::new(lines).style(Style::default().bg(theme.panel())),
-                    inner,
-                );
+                crate::overlay::render_lines(f, inner, lines, theme);
             }
             // Toast overlay: render transient messages at the bottom of the
             // content area, above the footer. Each toast is one line.

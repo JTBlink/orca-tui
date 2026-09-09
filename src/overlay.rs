@@ -43,6 +43,19 @@ pub(crate) fn begin_popup(
     inner
 }
 
+/// 绘制 overlay 的纯文本内容，统一背景样式与 widget 委托。
+pub(crate) fn render_lines<'a>(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: Vec<Line<'a>>,
+    theme: &ThemeConfig,
+) {
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(lines).style(Style::default().bg(theme.panel())),
+        area,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

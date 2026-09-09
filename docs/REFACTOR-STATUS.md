@@ -11,6 +11,8 @@
   `App` 不再维护这些 transient state 的平行字段。
 - `render_model::RenderModel` 从 slot 派生 sidebar 与状态 tally，并携带一次性的
   `OverlayModel` 快照（Jump、Spawn、Tasks、Settings、Activity、Dashboard 等 modal 的只读视图数据）。
+- `overlay` 模块统一 popup 几何、清屏和主题边框；所有 modal 已通过该边界创建内容区域，
+  并通过统一的 `render_lines` 委托文本内容绘制。
 - `daemon_connection::DaemonConnection` 封装 daemon RPC/stream，并提供专用 writer 线程。
 - GitHub Tasks 列表和 daemon 写入不再阻塞 UI loop。
 - daemon 动态 `createOrAttach` 通过独立 worker 完成，UI 先展示占位 pane，再以非阻塞轮询
