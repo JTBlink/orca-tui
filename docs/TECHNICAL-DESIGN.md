@@ -38,6 +38,7 @@ Orca daemon：Orca daemon --control/stream sockets-->
 | `daemon_server.rs` | 内置 daemon、attach 协议和会话持有 |
 | `orca_daemon.rs` | Orca GUI daemon v36 客户端 |
 | `worktree.rs` | Git worktree 创建、分支和生命周期清理 |
+| `debug_log.rs` | 可选的脱敏诊断日志（worktree/sidebar 拓扑与终端探针） |
 | `coordinator.rs` | 顺序/并行任务依赖和派发 |
 | `integrations.rs` | GitHub CLI issue/PR 数据源 |
 | `ssh.rs` | SSH 目标解析、命令包装和重连策略 |
@@ -62,6 +63,7 @@ PTY bytes
 
 `--worktree` 时，`WorktreeManager` 在仓库根目录的 `.orca-worktrees/` 下创建
 `<slug>-<id>` 工作区和 `orca/<slug>-<id>` 分支；`OwnedWorktrees` 在应用销毁时尽力清理。
+这组 worktree 是本地会话级资源，不等同于 Orca GUI 的全局 workspace catalog。
 
 ## 内置 daemon 协议
 
@@ -145,3 +147,6 @@ cargo clippy --all-targets --all-features
 - 自定义 Spawn 命令只按空白拆分，不解析 shell 引号。
 - Tasks 的 `gh` 请求为同步调用，慢网络会暂时阻塞界面。
 - SSH IPv6、重连次数和 worktree 清理失败路径需要单独覆盖。
+- 当前 sidebar 只从 `PaneSlot` 派生运行中 pane；不会读取 Orca CLI 的
+  `worktree list/ps` 全局工作区目录。需要展示全局工作区时，应新增独立 inventory
+  与 host/repo scope 处理，不能把 Git 当前仓库的数量直接当作工作台总数。

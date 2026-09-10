@@ -116,6 +116,30 @@ impl WorktreeManager {
         &self.repo_root
     }
 
+    /// Count worktrees currently registered by Git.
+    ///
+    /// This is a diagnostic primitive rather than an application inventory:
+    /// the TUI still models running panes separately from Git/Orca worktrees.
+    /// Only the count is exposed to callers so diagnostics do not need to
+    /// persist checkout paths.
+    pub(crate) fn registered_count(&self) -> Result<usize> {
+        let out = self
+            .git()
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .context("failed to spawn git worktree list")?;
+        if !out.status.success() {
+            bail!(
+                "git worktree list failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| line.strip_prefix("worktree ").is_some())
+            .count())
+    }
+
     /// Create a fresh worktree + branch for `agent_name`.
     ///
     /// `agent_name` is sanitized to a filesystem/branch-safe slug; the worktree
@@ -728,6 +752,15 @@ mod tests {
             4,
             "expected 4 worktree lines, got:\n{list}"
         );
+        assert_eq!(mgr.registered_count().expect("count worktrees"), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registered_count_includes_main_worktree() {
+        let repo = TempRepo::new().expect("temp git repo");
+        let mgr = WorktreeManager::open(&repo.path).expect("open");
+        assert_eq!(mgr.registered_count().expect("count worktrees"), 1);
     }
 
     #[cfg(unix)]

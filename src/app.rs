@@ -250,6 +250,10 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// and reused by `spawn_one_local` / `respawn` so newly-spawned panes don't
     /// fall back to $HOME (portable-pty's default when no cwd is set).
     launch_cwd: PathBuf,
+    /// Last pane/sidebar cardinality written to the optional worktree
+    /// diagnosis log. Keeps topology diagnostics useful without a 60fps log
+    /// flood.
+    debug_last_sidebar_signature: Option<(usize, usize, usize)>,
     /// Monotonic counter for the next [`Pane::id`]. Each pane gets a fresh id
     /// at spawn (never reused), so the bus forwarder — which reports
     /// `AgentUpdate::Output { pane_id }` by id — keeps targeting the RIGHT pane
@@ -404,6 +408,49 @@ impl App {
         // NOTE: we keep `bus_tx` (stored on the App) rather than dropping it,
         // so `spawn_one` can add orchestrated panes mid-run.
 
+        // Diagnostic-only snapshot: Git worktree inventory is independent from
+        // the pane/sidebar model. Record the two cardinalities at startup
+        // without persisting repository paths or raw Git errors.
+        if crate::debug_log::enabled() {
+            let owned_count = owned
+                .as_ref()
+                .map_or(0, |worktrees| worktrees.entries().len());
+            match owned.as_ref() {
+                Some(worktrees) => match worktrees.manager().registered_count() {
+                    Ok(registered_count) => crate::debug_log::append(format_args!(
+                        "{} startup isolate=true panes={} owned_created={} git_registered={} sidebar_source=running_panes",
+                        crate::debug_log::WORKTREE_PREFIX,
+                        panes.len(),
+                        owned_count,
+                        registered_count
+                    )),
+                    Err(err) => crate::debug_log::append(format_args!(
+                        "{} startup isolate=true panes={} owned_created={} git_probe=error:{} sidebar_source=running_panes",
+                        crate::debug_log::WORKTREE_PREFIX,
+                        panes.len(),
+                        owned_count,
+                        crate::debug_log::classify_error(err.as_ref())
+                    )),
+                },
+                None => match WorktreeManager::open(&launch_cwd)
+                    .and_then(|manager| manager.registered_count())
+                {
+                    Ok(registered_count) => crate::debug_log::append(format_args!(
+                        "{} startup isolate=false panes={} owned_created=0 git_registered={} sidebar_source=running_panes",
+                        crate::debug_log::WORKTREE_PREFIX,
+                        panes.len(),
+                        registered_count
+                    )),
+                    Err(err) => crate::debug_log::append(format_args!(
+                        "{} startup isolate=false panes={} owned_created=0 git_probe=error:{} sidebar_source=running_panes",
+                        crate::debug_log::WORKTREE_PREFIX,
+                        panes.len(),
+                        crate::debug_log::classify_error(err.as_ref())
+                    )),
+                },
+            }
+        }
+
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::new(backend).context("building ratatui terminal")?;
 
@@ -436,6 +483,7 @@ impl App {
             activity: ActivityLog::new(),
             pane_rects: Vec::new(),
             launch_cwd,
+            debug_last_sidebar_signature: None,
             next_pane_id: next_id,
             tasks_repo: None,
             tasks_items: Vec::new(),
@@ -871,24 +919,17 @@ impl<B: Backend> App<B> {
                         pane.feed(&bytes);
                         // Optional live debug log (ORCA_DEBUG_LOG=1): did the
                         // bytes reach the emulator, and does vt100 have content?
-                        if std::env::var("ORCA_DEBUG_LOG").is_ok() {
+                        if crate::debug_log::enabled() {
                             let cells = pane
                                 .emulator()
                                 .grid()
                                 .iter()
                                 .map(|row| row.iter().filter(|c| c.has_contents()).count())
                                 .sum::<usize>();
-                            let mut f = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open("/tmp/orca-live.log")
-                                .unwrap();
-                            use std::io::Write;
-                            let _ = writeln!(
-                                f,
+                            crate::debug_log::append(format_args!(
                                 "pane {pane_id}: +{} bytes → emulator now has {cells} non-empty cells",
                                 bytes.len()
-                            );
+                            ));
                         }
                         r
                     }
@@ -1646,6 +1687,23 @@ impl<B: Backend> App<B> {
         // Derive an immutable render model before borrowing panes mutably for
         // viewport reconciliation and drawing.
         let mut render_model = RenderModel::from_slots(&self.panes, self.focus);
+        if crate::debug_log::enabled() {
+            let signature = (
+                self.panes.len(),
+                render_model.sidebar_entries.len(),
+                self.focus,
+            );
+            if self.debug_last_sidebar_signature != Some(signature) {
+                crate::debug_log::append(format_args!(
+                    "{} render pane_count={} sidebar_entry_count={} focus={} source=PaneSlot",
+                    crate::debug_log::WORKTREE_PREFIX,
+                    signature.0,
+                    signature.1,
+                    signature.2
+                ));
+                self.debug_last_sidebar_signature = Some(signature);
+            }
+        }
         render_model.pane_rects = rects.clone();
         render_model.footer_hint = if zoomed {
             FOOTER_ZOOM.to_string()
@@ -3425,6 +3483,7 @@ mod tests {
                 activity: ActivityLog::new(),
                 pane_rects: Vec::new(),
                 launch_cwd: std::env::current_dir().unwrap_or_default(),
+                debug_last_sidebar_signature: None,
                 next_pane_id: 0,
                 tasks_repo: None,
                 tasks_items: Vec::new(),

@@ -482,6 +482,13 @@ fn run_attach(socket_path: &Path) -> Result<()> {
     use std::sync::mpsc;
 
     let (mut client, sessions) = AttachClient::connect(socket_path)?;
+    if crate::debug_log::enabled() {
+        crate::debug_log::append(format_args!(
+            "{} attach session_count={} sidebar_source=daemon_sessions worktree_inventory=not_available",
+            crate::debug_log::WORKTREE_PREFIX,
+            sessions.len()
+        ));
+    }
 
     // Set up terminal.
     enable_raw_mode()?;

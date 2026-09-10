@@ -216,8 +216,32 @@ orca-tui-inject record --for-secs 8 --size 80x24 --out recording.bin -- opencode
 orca-tui-inject replay recording.bin --size 80x24 --chunk 256 --render
 ```
 
-设置 `ORCA_DEBUG_LOG=1` 会把底层数据和 resize 日志写入 `/tmp/orca-live.log`；
+设置 `ORCA_DEBUG_LOG=1` 会把底层数据、resize 以及 worktree/sidebar
+拓扑诊断写入 `/tmp/orca-live.log`。worktree 诊断只记录数量和受控状态，
+不记录用户路径、命令、提示词、token 或原始 Git 输出；
 `ORCA_NO_RESPOND=1` 可临时关闭终端能力查询响应。
+
+### 与 Orca 工作区清单对照
+
+Orca CLI 获取的是 Orca runtime 的持久化工作区目录；不加
+repo/limit 时会返回当前可覆盖 host 范围内的全局 catalog：
+
+```bash
+orca repo list --json
+orca worktree list --json
+orca worktree ps --json
+orca worktree current --json
+```
+
+其中 `worktree list` 返回所有已登记工作区，`worktree ps` 额外汇总
+终端存活和 agent 状态；两者都可能包含多个 repo 和 host。`worktree current`
+只解析当前目录对应的一行。
+
+`orca-tui run --cwd DIR --worktree` 是本地会话级隔离：它只创建本次运行的
+`.orca-worktrees/`，退出时清理；普通 sidebar 只展示运行中的 pane。`orca-tui attach`
+从 daemon 获取 session（id/name/state/command），当前不读取 Orca 的全局
+worktree catalog。开启 `ORCA_DEBUG_LOG=1` 后，可用 `[DEBUG-worktree]`
+行确认这两类数量及数据源。
 
 ## 文档与许可证
 
