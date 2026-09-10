@@ -48,6 +48,7 @@ use crate::input::{self, FocusDirection as FocusDir, InputCommand, InputMode, In
 use crate::integrations::RepoRef;
 use crate::layout::split_panes;
 use crate::mobile::AgentSnapshot;
+use crate::orca_workspaces::OrcaWorkspace;
 use crate::pane::Pane;
 use crate::pane_slot::PaneSlot;
 use crate::pty_session::PtySession;
@@ -185,6 +186,10 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// removing a directory that is still a live process's cwd would fail.
     /// `None` when not in worktree-isolation mode.
     worktrees: Option<OwnedWorktrees>,
+    /// Complete Orca workspace catalog rows that do not have a local pane.
+    /// Local rows are represented by their running pane and are filtered out
+    /// at render time to avoid duplicate sidebar entries.
+    workspace_catalog: Vec<OrcaWorkspace>,
     /// Feature 5: adaptive frame scheduler — throttles rendering to a 60fps
     /// budget, skips frames when behind (backpressure), and backs off the poll
     /// interval when idle (no input/agent output) to save CPU.
@@ -302,6 +307,18 @@ impl App {
     /// Returns an error only if the ratatui terminal/backend cannot be
     /// constructed.
     pub fn spawn_agents(specs: Vec<AgentSpec>, cwd: Option<&Path>, isolate: bool) -> Result<Self> {
+        Self::spawn_agents_with_catalog(specs, cwd, isolate, Vec::new())
+    }
+
+    /// Spawn agents and retain the complete Orca workspace catalog for the
+    /// sidebar. Catalog rows without a local PTY remain visible as read-only
+    /// workspace rows, including remote and archived workspaces.
+    pub fn spawn_agents_with_catalog(
+        specs: Vec<AgentSpec>,
+        cwd: Option<&Path>,
+        isolate: bool,
+        workspace_catalog: Vec<OrcaWorkspace>,
+    ) -> Result<Self> {
         // Size the PTYs from the real terminal so the agent's first frame is
         // already correct once we enter raw mode + alt screen in `run`.
         // `unwrap_or` only covers the error path; a freshly spawned PTY (or a
@@ -377,6 +394,8 @@ impl App {
                         pane.set_branch(Some(branch));
                     }
                     let mut slot = PaneSlot::new(pane, command.clone());
+                    slot.workspace_id = spec.workspace_id.clone();
+                    slot.worktree_path = spec.worktree.clone();
                     slot.session = Some(session);
                     panes.push(slot);
                     // Pump this session's blocking receiver onto the async bus
@@ -397,7 +416,10 @@ impl App {
                     eprintln!("orcatui: failed to spawn {name:?}: {err:#}");
                     let mut pane = Pane::new(id, &name, cols, rows);
                     pane.set_state(AgentState::Failed(format!("{err:#}")));
-                    panes.push(PaneSlot::new(pane, command.clone()));
+                    let mut slot = PaneSlot::new(pane, command.clone());
+                    slot.workspace_id = spec.workspace_id.clone();
+                    slot.worktree_path = spec.worktree.clone();
+                    panes.push(slot);
                 }
             }
             // Per-pane lifecycle state is owned by the slot.
@@ -406,9 +428,8 @@ impl App {
         // NOTE: we keep `bus_tx` (stored on the App) rather than dropping it,
         // so `spawn_one` can add orchestrated panes mid-run.
 
-        // Diagnostic-only snapshot: Git worktree inventory is independent from
-        // the pane/sidebar model. Record the two cardinalities at startup
-        // without persisting repository paths or raw Git errors.
+        // Diagnostic-only snapshot: record Git and Orca catalog cardinalities
+        // without persisting repository paths or raw command output.
         if crate::debug_log::enabled() {
             let owned_count = owned
                 .as_ref()
@@ -416,17 +437,19 @@ impl App {
             match owned.as_ref() {
                 Some(worktrees) => match worktrees.manager().registered_count() {
                     Ok(registered_count) => crate::debug_log::append(format_args!(
-                        "{} startup isolate=true panes={} owned_created={} git_registered={} sidebar_source=running_panes",
+                        "{} startup isolate=true panes={} owned_created={} catalog_rows={} git_registered={} sidebar_source=running_panes",
                         crate::debug_log::WORKTREE_PREFIX,
                         panes.len(),
                         owned_count,
+                        workspace_catalog.len(),
                         registered_count
                     )),
                     Err(err) => crate::debug_log::append(format_args!(
-                        "{} startup isolate=true panes={} owned_created={} git_probe=error:{} sidebar_source=running_panes",
+                        "{} startup isolate=true panes={} owned_created={} catalog_rows={} git_probe=error:{} sidebar_source=running_panes",
                         crate::debug_log::WORKTREE_PREFIX,
                         panes.len(),
                         owned_count,
+                        workspace_catalog.len(),
                         crate::debug_log::classify_error(err.as_ref())
                     )),
                 },
@@ -434,15 +457,17 @@ impl App {
                     .and_then(|manager| manager.registered_count())
                 {
                     Ok(registered_count) => crate::debug_log::append(format_args!(
-                        "{} startup isolate=false panes={} owned_created=0 git_registered={} sidebar_source=git_worktrees_or_running_panes",
+                        "{} startup isolate=false panes={} owned_created=0 catalog_rows={} git_registered={} sidebar_source=orca_catalog_or_git_fallback",
                         crate::debug_log::WORKTREE_PREFIX,
                         panes.len(),
+                        workspace_catalog.len(),
                         registered_count
                     )),
                     Err(err) => crate::debug_log::append(format_args!(
-                        "{} startup isolate=false panes={} owned_created=0 git_probe=error:{} sidebar_source=git_worktrees_or_running_panes",
+                        "{} startup isolate=false panes={} owned_created=0 catalog_rows={} git_probe=error:{} sidebar_source=orca_catalog_or_git_fallback",
                         crate::debug_log::WORKTREE_PREFIX,
                         panes.len(),
+                        workspace_catalog.len(),
                         crate::debug_log::classify_error(err.as_ref())
                     )),
                 },
@@ -460,6 +485,7 @@ impl App {
             quit: false,
             raw_mode_active: false,
             worktrees: owned,
+            workspace_catalog,
             scheduler: FrameScheduler::new(TARGET_FRAME_60FPS, Instant::now()),
             snapshot_tx: None,
             coordinator: None,
@@ -513,6 +539,33 @@ fn spec_launch_target(spec: &AgentSpec, launch_cwd: &Path) -> (PathBuf, Option<S
 // injected in tests (no TTY required) — the production type is still
 // `App<CrosstermBackend<Stdout>>` via the default type parameter.
 impl<B: Backend> App<B> {
+    /// Replace the startup workspace catalog used by the sidebar. A caller
+    /// may load it before entering the terminal loop so the first rendered
+    /// frame already contains every Orca workspace.
+    pub fn set_workspace_catalog(&mut self, catalog: Vec<OrcaWorkspace>) {
+        self.workspace_catalog = catalog;
+    }
+
+    fn catalog_sidebar_entries(&self) -> Vec<crate::sidebar::SidebarEntry> {
+        self.workspace_catalog
+            .iter()
+            .filter(|workspace| {
+                !self
+                    .panes
+                    .iter()
+                    .any(|pane| pane.workspace_id.as_deref() == Some(workspace.id.as_str()))
+            })
+            .map(|workspace| crate::sidebar::SidebarEntry {
+                name: workspace.sidebar_name(),
+                state: AgentState::Idle,
+                branch: Some(workspace.sidebar_branch()),
+                activity: None,
+                focused: false,
+                pinned: false,
+            })
+            .collect()
+    }
+
     /// Attach a mobile-companion snapshot publisher (Feature 10). Once set,
     /// [`App::main_loop`] publishes a `Vec<AgentSnapshot>` every frame; the
     /// WebSocket server drains it and broadcasts to connected clients.
@@ -1098,7 +1151,10 @@ impl<B: Backend> App<B> {
             "command": command.first().cloned().unwrap_or_default(),
         });
         let pane = Pane::new(id, &name, cols, rows);
-        self.panes.push(PaneSlot::new(pane, command.clone()));
+        let mut slot = PaneSlot::new(pane, command.clone());
+        slot.workspace_id = spec.workspace_id.clone();
+        slot.worktree_path = spec.worktree.clone();
+        self.panes.push(slot);
         let rx = self
             .daemon
             .as_ref()
@@ -1178,7 +1234,10 @@ impl<B: Backend> App<B> {
                 if let Some(branch) = branch_label {
                     pane.set_branch(Some(branch));
                 }
-                self.panes.push(PaneSlot::new(pane, command.clone()));
+                let mut slot = PaneSlot::new(pane, command.clone());
+                slot.workspace_id = spec.workspace_id.clone();
+                slot.worktree_path = spec.worktree.clone();
+                self.panes.push(slot);
                 let tx = self.bus_tx.clone();
                 let _ = thread::Builder::new()
                     .name(format!("orca-bus-fwd({name})"))
@@ -1193,7 +1252,10 @@ impl<B: Backend> App<B> {
                 // below carries the error into the header + sidebar instead.
                 let mut pane = Pane::new(id, &name, cols, rows);
                 pane.set_state(AgentState::Failed(format!("{err:#}")));
-                self.panes.push(PaneSlot::new(pane, command.clone()));
+                let mut slot = PaneSlot::new(pane, command.clone());
+                slot.workspace_id = spec.workspace_id.clone();
+                slot.worktree_path = spec.worktree.clone();
+                self.panes.push(slot);
             }
         }
         self.panes.last_mut().expect("spawned pane").task = None;
@@ -1342,7 +1404,12 @@ impl<B: Backend> App<B> {
         };
         let cols = self.cols;
         let rows = self.rows;
-        match PtySession::spawn(command, Some(&self.launch_cwd), cols, rows) {
+        let agent_cwd = self
+            .panes
+            .get(i)
+            .and_then(|slot| slot.worktree_path.as_deref())
+            .unwrap_or(&self.launch_cwd);
+        match PtySession::spawn(command, Some(agent_cwd), cols, rows) {
             Ok((session, rx)) => {
                 if let Some(pane) = self.panes.get_mut(i) {
                     pane.session = Some(session);
@@ -1704,7 +1771,9 @@ impl<B: Backend> App<B> {
 
         // Derive an immutable render model before borrowing panes mutably for
         // viewport reconciliation and drawing.
-        let mut render_model = RenderModel::from_slots(&self.panes, self.focus);
+        let catalog_entries = self.catalog_sidebar_entries();
+        let mut render_model =
+            RenderModel::from_slots_with_catalog(&self.panes, self.focus, &catalog_entries);
         if crate::debug_log::enabled() {
             let signature = (
                 self.panes.len(),
@@ -1713,10 +1782,11 @@ impl<B: Backend> App<B> {
             );
             if self.debug_last_sidebar_signature != Some(signature) {
                 crate::debug_log::append(format_args!(
-                    "{} render pane_count={} sidebar_entry_count={} focus={} source=PaneSlot",
+                    "{} render pane_count={} sidebar_entry_count={} catalog_only={} focus={} source=PaneSlot+OrcaCatalog",
                     crate::debug_log::WORKTREE_PREFIX,
                     signature.0,
                     signature.1,
+                    catalog_entries.len(),
                     signature.2
                 ));
                 self.debug_last_sidebar_signature = Some(signature);
@@ -3372,6 +3442,7 @@ impl<B: Backend> App<B> {
     /// breaks (and [`App::run`] prints `exit_reason`).
     fn should_auto_exit(&self) -> bool {
         self.all_sessions_gone()
+            && self.catalog_sidebar_entries().is_empty()
             && self.orchestration_drained()
             && self.daemon_spawn_rx.is_empty()
             && self.panes.iter().all(|slot| slot.reconnect_due.is_none())
@@ -3480,6 +3551,7 @@ mod tests {
                 quit: false,
                 raw_mode_active: false,
                 worktrees: None,
+                workspace_catalog: Vec::new(),
                 scheduler: FrameScheduler::new(TARGET_FRAME_60FPS, Instant::now()),
                 snapshot_tx: None,
                 coordinator: None,
@@ -4292,10 +4364,47 @@ mod tests {
             command: vec!["bash".to_owned()],
             worktree: Some(PathBuf::from("/tmp/feature-worktree")),
             worktree_branch: Some("feature/login".to_owned()),
+            workspace_id: None,
         };
         let (cwd, label) = spec_launch_target(&spec, Path::new("/tmp/repo"));
         assert_eq!(cwd, PathBuf::from("/tmp/feature-worktree"));
         assert_eq!(label.as_deref(), Some("feature/login"));
+    }
+
+    #[test]
+    fn catalog_sidebar_keeps_remote_rows_and_deduplicates_local_panes() {
+        let mut app = App::for_test(vec![pane(0, "repo/main")]);
+        app.panes[0].workspace_id = Some("repo-a::/local/main".to_owned());
+        app.workspace_catalog = vec![
+            OrcaWorkspace {
+                id: "repo-a::/local/main".to_owned(),
+                path: PathBuf::from("/local/main"),
+                branch: "main".to_owned(),
+                display_name: "main".to_owned(),
+                repo_id: "repo-a".to_owned(),
+                project_id: Some("github:org/repo-a".to_owned()),
+                host_id: Some("local".to_owned()),
+                is_archived: false,
+                workspace_status: None,
+                is_main_worktree: true,
+            },
+            OrcaWorkspace {
+                id: "repo-b::/remote/feature".to_owned(),
+                path: PathBuf::from("/remote/feature"),
+                branch: "feature/login".to_owned(),
+                display_name: "login".to_owned(),
+                repo_id: "repo-b".to_owned(),
+                project_id: Some("github:org/repo-b".to_owned()),
+                host_id: Some("ssh-host".to_owned()),
+                is_archived: false,
+                workspace_status: None,
+                is_main_worktree: false,
+            },
+        ];
+        let rows = app.catalog_sidebar_entries();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "repo-b/login");
+        assert_eq!(rows[0].branch.as_deref(), Some("feature/login @ ssh-host"));
     }
 
     #[test]

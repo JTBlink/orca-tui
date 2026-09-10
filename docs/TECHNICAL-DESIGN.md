@@ -37,6 +37,7 @@ Orca daemon：Orca daemon --control/stream sockets-->
 | `scheduler.rs` / `layout.rs` / `sidebar.rs` | 刷新调度、网格布局和侧边栏 |
 | `daemon_server.rs` | 内置 daemon、attach 协议和会话持有 |
 | `orca_daemon.rs` | Orca GUI daemon v36 客户端 |
+| `orca_workspaces.rs` | Orca CLI 全局 workspace catalog 读取、完整性校验和降级 |
 | `worktree.rs` | Git worktree 创建、分支和生命周期清理 |
 | `debug_log.rs` | 可选的脱敏诊断日志（worktree/sidebar 拓扑与终端探针） |
 | `coordinator.rs` | 顺序/并行任务依赖和派发 |
@@ -147,6 +148,8 @@ cargo clippy --all-targets --all-features
 - 自定义 Spawn 命令只按空白拆分，不解析 shell 引号。
 - Tasks 的 `gh` 请求为同步调用，慢网络会暂时阻塞界面。
 - SSH IPv6、重连次数和 worktree 清理失败路径需要单独覆盖。
-- 当前 sidebar 只从 `PaneSlot` 派生运行中 pane；不会读取 Orca CLI 的
-  `worktree list/ps` 全局工作区目录。需要展示全局工作区时，应新增独立 inventory
-  与 host/repo scope 处理，不能把 Git 当前仓库的数量直接当作工作台总数。
+- 普通启动和 `run --all-worktrees` 会优先读取 Orca CLI 的
+  `worktree list --json` 全局 catalog；local checkout 映射到 pane，远程或不可访问的
+  workspace 作为只读 sidebar 条目保留。仅当 Orca CLI 不可用时才回退到当前 Git 仓库的
+  `git worktree list`，不能把 Git 当前仓库的数量当作全局工作台总数。`attach` 会将
+  daemon session 与这份 catalog 并列渲染，daemon 协议不负责提供 workspace inventory。

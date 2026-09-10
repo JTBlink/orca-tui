@@ -48,7 +48,17 @@ impl RenderModel {
     /// 从当前 slot 集合生成渲染模型。
     #[must_use]
     pub(crate) fn from_slots(slots: &[PaneSlot], focus: usize) -> Self {
-        let sidebar_entries = slots
+        Self::from_slots_with_catalog(slots, focus, &[])
+    }
+
+    /// 从运行中 pane 和未被 pane 承载的 Orca catalog 行生成侧边栏模型。
+    #[must_use]
+    pub(crate) fn from_slots_with_catalog(
+        slots: &[PaneSlot],
+        focus: usize,
+        catalog_entries: &[SidebarEntry],
+    ) -> Self {
+        let mut sidebar_entries = slots
             .iter()
             .enumerate()
             .map(|(i, slot)| SidebarEntry {
@@ -60,6 +70,7 @@ impl RenderModel {
                 pinned: slot.pinned,
             })
             .collect::<Vec<_>>();
+        sidebar_entries.extend(catalog_entries.iter().cloned());
         let statuses = sidebar_entries
             .iter()
             .map(|entry| {

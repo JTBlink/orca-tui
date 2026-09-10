@@ -357,6 +357,9 @@ pub struct AgentSpec {
     pub worktree: Option<PathBuf>,
     /// Branch or workspace label associated with `worktree`.
     pub worktree_branch: Option<String>,
+    /// Stable Orca catalog id for this workspace, when launched from the
+    /// global workspace inventory.
+    pub workspace_id: Option<String>,
 }
 
 impl AgentSpec {
@@ -387,6 +390,7 @@ impl AgentSpec {
             command,
             worktree: None,
             worktree_branch: None,
+            workspace_id: None,
         }
     }
 }

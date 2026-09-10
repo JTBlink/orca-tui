@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 use crate::agent::{AgentKind, AgentSpec};
 use crate::app::App;
 use crate::integrations::{self, RepoRef};
+use crate::orca_workspaces::{self, OrcaWorkspace};
 use crate::ssh::SshTarget;
 use crate::worktree::WorktreeManager;
 use crate::{coordinator, mobile};
@@ -238,18 +239,19 @@ fn dispatch_command(command: Command) -> Result<()> {
                 cwd
             };
 
-            let specs = if all_worktrees {
+            let (specs, workspace_catalog) = if all_worktrees {
                 if daemon || worktree || reconnect {
                     anyhow::bail!(
                         "--all-worktrees cannot be combined with --daemon, --worktree, or --reconnect"
                     );
                 }
-                prepare_all_worktree_specs(command, cwd.as_deref(), remote.as_deref())?
+                prepare_all_worktree_specs_with_catalog(command, cwd.as_deref(), remote.as_deref())?
             } else {
-                prepare_run_specs(command, remote.as_deref())?
+                (prepare_run_specs(command, remote.as_deref())?, Vec::new())
             };
 
-            let mut app = App::spawn_agents(specs, cwd.as_deref(), worktree)?;
+            let mut app =
+                App::spawn_agents_with_catalog(specs, cwd.as_deref(), worktree, workspace_catalog)?;
 
             // Try to connect to an Orca GUI daemon (--daemon). Falls back to
             // standalone silently if no daemon is found; shows a toast if a
@@ -424,7 +426,7 @@ fn dispatch_command(command: Command) -> Result<()> {
         }
 
         Command::Attach { socket } => {
-            use crate::daemon_server::{default_socket_path, AttachClient};
+            use crate::daemon_server::default_socket_path;
 
             let socket_path = socket.unwrap_or_else(default_socket_path);
             run_attach(&socket_path)?;
@@ -460,11 +462,24 @@ fn prepare_run_specs(command: Vec<String>, remote: Option<&str>) -> Result<Vec<A
 /// The worktree path is retained on the spec so App can use it as the PTY cwd;
 /// unlike `--worktree`, these checkouts are existing Orca/Git workspaces and
 /// are not removed when the TUI exits.
+#[cfg(test)]
 fn prepare_all_worktree_specs(
     command: Vec<String>,
     cwd: Option<&Path>,
     remote: Option<&str>,
 ) -> Result<Vec<AgentSpec>> {
+    Ok(prepare_all_worktree_specs_with_catalog(command, cwd, remote)?.0)
+}
+
+/// Build the launch plan and retain the complete Orca catalog for sidebar
+/// rendering. Orca rows on another execution host are displayed but are not
+/// handed to a local PTY; this prevents a remote path from being mistaken for
+/// a local checkout while still keeping the workspace visible.
+fn prepare_all_worktree_specs_with_catalog(
+    command: Vec<String>,
+    cwd: Option<&Path>,
+    remote: Option<&str>,
+) -> Result<(Vec<AgentSpec>, Vec<OrcaWorkspace>)> {
     if remote.is_some() {
         anyhow::bail!("--all-worktrees cannot be combined with --remote");
     }
@@ -496,35 +511,57 @@ fn prepare_all_worktree_specs(
     let base = cwd
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    if let Ok(catalog) = orca_workspaces::list_all() {
+        if !catalog.is_empty() {
+            let specs = catalog
+                .iter()
+                .filter(|workspace| workspace.is_local() && !workspace.is_archived)
+                .map(|workspace| agent_spec_for_workspace(&command, workspace))
+                .collect::<Vec<_>>();
+            return Ok((specs, catalog));
+        }
+    }
+
+    // Orca is optional. Preserve the previous local-Git behavior when its
+    // catalog command is unavailable or disconnected.
     let manager = match WorktreeManager::open(&base) {
         Ok(manager) => manager,
-        Err(_) => return Ok(vec![AgentSpec::from_command(command)]),
+        Err(_) => return Ok((vec![AgentSpec::from_command(command)], Vec::new())),
     };
     let worktrees = manager.list_registered()?;
     if worktrees.is_empty() {
-        return Ok(vec![AgentSpec::from_command(command)]);
+        return Ok((vec![AgentSpec::from_command(command)], Vec::new()));
     }
 
-    Ok(worktrees
+    let catalog = worktrees
         .into_iter()
-        .map(|worktree| {
-            let mut spec = AgentSpec::from_command(command.clone());
-            let name = if worktree.branch == "detached" {
-                worktree
-                    .path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("detached")
-                    .to_owned()
-            } else {
-                worktree.branch.clone()
-            };
-            spec.name = name;
-            spec.worktree_branch = Some(worktree.branch);
-            spec.worktree = Some(worktree.path);
-            spec
+        .map(|worktree| OrcaWorkspace {
+            id: worktree.path.display().to_string(),
+            path: worktree.path,
+            branch: worktree.branch.clone(),
+            display_name: worktree.branch,
+            repo_id: String::new(),
+            project_id: None,
+            host_id: Some("local".to_owned()),
+            is_archived: false,
+            workspace_status: None,
+            is_main_worktree: false,
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let specs = catalog
+        .iter()
+        .map(|workspace| agent_spec_for_workspace(&command, workspace))
+        .collect();
+    Ok((specs, catalog))
+}
+
+fn agent_spec_for_workspace(command: &[String], workspace: &OrcaWorkspace) -> AgentSpec {
+    let mut spec = AgentSpec::from_command(command.to_vec());
+    spec.name = workspace.sidebar_name();
+    spec.worktree_branch = Some(workspace.branch.clone());
+    spec.workspace_id = Some(workspace.id.clone());
+    spec.worktree = Some(workspace.path.clone());
+    spec
 }
 
 /// Install a SIGTERM handler that sets the atomic shutdown flag.
@@ -554,6 +591,7 @@ fn run_attach(socket_path: &Path) -> Result<()> {
     use crate::daemon_server::AttachClient;
     use crate::layout::split_panes;
     use crate::pane::Pane;
+    use crate::sidebar::{self, SidebarEntry};
     use base64::{engine::general_purpose, Engine as _};
     use crossterm::event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -570,11 +608,29 @@ fn run_attach(socket_path: &Path) -> Result<()> {
     use std::sync::mpsc;
 
     let (mut client, sessions) = AttachClient::connect(socket_path)?;
+    // The daemon protocol only knows about live agent sessions. Load Orca's
+    // global workspace catalog separately so an attach client still shows
+    // every workspace across repositories and execution hosts, including
+    // remote/archived rows that do not have a local PTY in this daemon.
+    let workspace_catalog = match orca_workspaces::list_all() {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            if crate::debug_log::enabled() {
+                crate::debug_log::append(format_args!(
+                    "{} attach workspace_catalog=unavailable error={}",
+                    crate::debug_log::WORKTREE_PREFIX,
+                    crate::debug_log::classify_error(err.as_ref())
+                ));
+            }
+            Vec::new()
+        }
+    };
     if crate::debug_log::enabled() {
         crate::debug_log::append(format_args!(
-            "{} attach session_count={} sidebar_source=daemon_sessions worktree_inventory=not_available",
+            "{} attach session_count={} catalog_rows={} sidebar_source=daemon_sessions+orca_catalog",
             crate::debug_log::WORKTREE_PREFIX,
-            sessions.len()
+            sessions.len(),
+            workspace_catalog.len()
         ));
     }
 
@@ -598,6 +654,7 @@ fn run_attach(socket_path: &Path) -> Result<()> {
     let mut focus: usize = 0;
     let config = crate::config::Config::default();
     let theme = &config.theme;
+    let sidebar_width = config.layout.sidebar_width;
 
     // Reader thread: reads NDJSON from the daemon, feeds output to a channel.
     let reader_stream = client.try_clone_stream()?;
@@ -657,10 +714,59 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                 }
             }
 
+            // Derive the attach sidebar before the draw closure mutably
+            // borrows panes. Daemon sessions are live panes; catalog rows are
+            // read-only workspace inventory entries and are intentionally
+            // appended even when they have no matching local session.
+            let mut sidebar_entries: Vec<SidebarEntry> = panes
+                .iter()
+                .map(|pane| SidebarEntry {
+                    name: pane.name().to_owned(),
+                    state: pane.state().clone(),
+                    branch: pane.branch().map(str::to_owned),
+                    activity: pane.activity().cloned(),
+                    focused: false,
+                    pinned: false,
+                })
+                .collect();
+            sidebar_entries.extend(workspace_catalog.iter().map(|workspace| SidebarEntry {
+                name: workspace.sidebar_name(),
+                state: crate::agent::AgentState::Idle,
+                branch: Some(workspace.sidebar_branch()),
+                activity: None,
+                focused: false,
+                pinned: false,
+            }));
+            if let Some(entry) = sidebar_entries.get_mut(focus) {
+                entry.focused = true;
+            }
+
             // Render.
             terminal.draw(|f| {
-                let area = f.area();
-                let rects = split_panes(area, panes.len());
+                let total = f.area();
+                let show_sidebar =
+                    sidebar_width > 0 && total.width > sidebar_width.saturating_add(22);
+                let (sidebar_area, pane_area) = if show_sidebar {
+                    let chunks = ratatui::layout::Layout::horizontal([
+                        ratatui::layout::Constraint::Length(sidebar_width),
+                        ratatui::layout::Constraint::Min(1),
+                    ])
+                    .spacing(1)
+                    .split(total);
+                    (Some(chunks[0]), chunks[1])
+                } else {
+                    (None, total)
+                };
+                if let Some(area) = sidebar_area {
+                    sidebar::render_sidebar(
+                        f,
+                        area,
+                        &sidebar_entries,
+                        theme,
+                        Some(("● Daemon", theme.success())),
+                    );
+                }
+                let rects = split_panes(pane_area, panes.len());
                 for (i, pane) in panes.iter_mut().enumerate() {
                     let pane_area = rects.get(i).copied().unwrap_or_default();
                     pane.render(f, pane_area, i == focus, theme);
@@ -860,11 +966,20 @@ mod tests {
     #[test]
     fn all_worktree_specs_follow_git_inventory() {
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let manager = WorktreeManager::open(&cwd).expect("the test crate is in a git repo");
-        let expected = manager.list_registered().expect("list worktrees");
+        let expected_specs = match orca_workspaces::list_all() {
+            Ok(rows) if !rows.is_empty() => rows
+                .iter()
+                .filter(|workspace| workspace.is_local() && !workspace.is_archived)
+                .count(),
+            _ => WorktreeManager::open(&cwd)
+                .expect("the test crate is in a git repo")
+                .list_registered()
+                .expect("list worktrees")
+                .len(),
+        };
         let specs = prepare_all_worktree_specs(vec!["echo".into()], Some(&cwd), None)
             .expect("build one spec per worktree");
-        assert_eq!(specs.len(), expected.len());
+        assert_eq!(specs.len(), expected_specs);
         assert!(specs.iter().all(|spec| {
             spec.worktree.is_some() && spec.worktree_branch.is_some() && spec.name != "echo"
         }));
@@ -879,7 +994,6 @@ mod tests {
             None,
         )
         .expect("build specs");
-        assert!(!specs.is_empty());
         assert!(specs
             .iter()
             .all(|spec| spec.command == ["echo", "workspace argument"]));

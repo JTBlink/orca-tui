@@ -28,6 +28,7 @@ pub mod integrations;
 pub mod layout;
 pub mod mobile;
 pub mod orca_daemon;
+pub mod orca_workspaces;
 pub mod osc;
 pub(crate) mod overlay;
 pub mod pane;

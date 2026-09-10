@@ -47,8 +47,9 @@ orca-tui
 ./orca-tui.sh
 ```
 
-在 Git 仓库内直接启动时，TUI 会自动枚举当前仓库已注册的全部 worktree，
-并为每个 worktree 建立一个 pane；Agent 会在对应 checkout 中运行。也可以显式使用
+直接启动时，TUI 会优先读取 Orca 的全局 workspace catalog，并为每个可访问的 local
+checkout 建立一个 pane；Agent 会在对应 checkout 中运行。远程或不可访问的 workspace
+也会保留在侧边栏中。也可以显式使用
 `--all-worktrees`：
 
 ```bash
@@ -56,8 +57,8 @@ orca-tui run --all-worktrees -- codex
 ```
 
 该模式使用已有工作区，不会在退出时删除它们。`--worktree` 仍表示为本次运行创建临时
-隔离 worktree，两者不能同时使用。仓库外启动或无法读取 Git worktree 时，会回退为普通
-单 pane 模式。
+隔离 worktree，两者不能同时使用。Orca catalog 不可用时，会回退到当前 Git 仓库的
+worktree 清单；无法发现 Git 仓库时再回退为普通单 pane 模式。
 
 运行 Agent：
 
@@ -249,11 +250,15 @@ orca worktree current --json
 终端存活和 agent 状态；两者都可能包含多个 repo 和 host。`worktree current`
 只解析当前目录对应的一行。
 
-`orca-tui run --cwd DIR --worktree` 是本地会话级隔离：它只创建本次运行的
-`.orca-worktrees/`，退出时清理；普通 sidebar 只展示运行中的 pane。`orca-tui attach`
-从 daemon 获取 session（id/name/state/command），当前不读取 Orca 的全局
-worktree catalog。开启 `ORCA_DEBUG_LOG=1` 后，可用 `[DEBUG-worktree]`
-行确认这两类数量及数据源。
+默认启动和 `orca-tui run --all-worktrees` 会优先读取
+`orca worktree list --json` 的完整 catalog，因此可以同时显示多个 repo、多个 host、
+远程和 archived workspace。当前机器上能访问的 local checkout 会启动 pane；远程或不可访问
+的 workspace 仍会以只读条目显示，不会把远程路径误当作本地 cwd。Orca CLI 不可用时才回退
+到当前 Git 仓库的 `git worktree list`。`--worktree` 仍是本地会话级隔离：只创建本次运行的
+`.orca-worktrees/`，退出时清理。`orca-tui attach` 会把 daemon session 与同一份全局
+workspace catalog 并列显示，但不会把 daemon session 当成 workspace catalog。开启
+`ORCA_DEBUG_LOG=1` 后，可用
+`[DEBUG-worktree]` 行确认 catalog、pane 和 sidebar 的数量。
 
 ## 文档与许可证
 

@@ -5,6 +5,7 @@
 //! kept together here so future migrations cannot introduce another parallel
 //! vector by accident.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::agent::AgentStatus;
@@ -18,6 +19,10 @@ pub(crate) struct PaneSlot {
     pub(crate) pane: Pane,
     pub(crate) session: Option<PtySession>,
     pub(crate) command: Vec<String>,
+    /// Orca catalog identity for the workspace hosting this pane.
+    pub(crate) workspace_id: Option<String>,
+    /// Existing checkout used when respawning this pane.
+    pub(crate) worktree_path: Option<PathBuf>,
     pub(crate) task: Option<TaskId>,
     pub(crate) daemon_session_id: Option<String>,
     pub(crate) reconnect: Option<ReconnectSession>,
@@ -48,6 +53,8 @@ impl PaneSlot {
             pane,
             session: None,
             command,
+            workspace_id: None,
+            worktree_path: None,
             task: None,
             daemon_session_id: None,
             reconnect: None,
