@@ -450,38 +450,37 @@ fn parse_catalog_details(
     let total_count = result
         .get("totalCount")
         .and_then(Value::as_u64)
-        .map(|value| value as usize);
+        .map(usize::try_from)
+        .transpose()
+        .context("Orca workspace totalCount exceeds this platform's usize")?;
     let truncated = result
         .get("truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let host_scope = result.get("hostScope").filter(|scope| scope.is_object());
-    let scope = CatalogScope {
-        reported: host_scope.is_some(),
-        covered_host_ids: host_scope
-            .and_then(|scope| scope.get("hostIds"))
-            .and_then(Value::as_array)
-            .map(|hosts| {
-                hosts
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
+    let scope = result
+        .get("hostScope")
+        .and_then(|scope| {
+            Some(CatalogScope {
+                reported: true,
+                covered_host_ids: parse_host_id_array(scope.get("hostIds")?)?,
+                omitted_host_ids: parse_host_id_array(scope.get("omittedHostIds")?)?,
             })
-            .unwrap_or_default(),
-        omitted_host_ids: host_scope
-            .and_then(|scope| scope.get("omittedHostIds"))
-            .and_then(Value::as_array)
-            .map(|hosts| {
-                hosts
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default(),
-    };
+        })
+        .unwrap_or_default();
     Ok((workspaces, total_count, truncated, scope))
+}
+
+fn parse_host_id_array(value: &Value) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|host| {
+            host.as_str()
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 fn parse_workspace(row: &Value) -> Result<OrcaWorkspace> {
@@ -546,8 +545,7 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    #[test]
-    fn catalog_queries_every_paired_environment_and_keeps_same_ids() {
+    fn install_fake_orca(script: &str, suffix: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -556,11 +554,23 @@ mod tests {
             .expect("system clock")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "orca-tui-catalog-test-{}-{unique}",
+            "orca-tui-catalog-{suffix}-{}-{unique}",
             std::process::id()
         ));
         std::fs::create_dir(&dir).expect("create test directory");
         let executable = dir.join("fake-orca");
+        std::fs::write(&executable, script).expect("write fake Orca");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("fake Orca metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).expect("make fake Orca executable");
+        (dir, executable)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_queries_every_paired_environment_and_keeps_same_ids() {
         let script = r##"#!/bin/sh
 case "$*" in
   "environment list --json")
@@ -578,12 +588,7 @@ case "$*" in
   *) exit 2 ;;
 esac
 "##;
-        std::fs::write(&executable, script).expect("write fake Orca");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("fake Orca metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions).expect("make fake Orca executable");
+        let (dir, executable) = install_fake_orca(script, "all-hosts");
 
         let catalog = list_all_with_executable(executable.as_os_str()).expect("load all hosts");
 
@@ -598,6 +603,36 @@ esac
         );
         assert!(catalog.unresolved_host_ids.is_empty());
         assert_eq!(catalog.unverifiable_scope_host_ids, vec!["runtime:env-b"]);
+
+        std::fs::remove_dir_all(&dir).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_retries_at_reported_total_without_a_fixed_ceiling() {
+        let script = r##"#!/bin/sh
+case "$*" in
+  "environment list --json")
+    printf '%s\n' '{"ok":true,"result":{"environments":[]}}'
+    ;;
+  "worktree list --json --limit 10000")
+    printf '%s\n' '{"ok":true,"result":{"worktrees":[{"id":"repo::/first","path":"/first","displayName":"first","repoId":"repo","hostId":"local"}],"totalCount":250000,"truncated":true,"hostScope":{"hostIds":["local"],"omittedHostIds":[]}}}'
+    ;;
+  "worktree list --json --limit 250000")
+    printf '%s\n' '{"ok":true,"result":{"worktrees":[{"id":"repo::/first","path":"/first","displayName":"first","repoId":"repo","hostId":"local"},{"id":"repo::/last","path":"/last","displayName":"last","repoId":"repo","hostId":"local"}],"totalCount":2,"truncated":false,"hostScope":{"hostIds":["local"],"omittedHostIds":[]}}}'
+    ;;
+  *) exit 2 ;;
+esac
+"##;
+        let (dir, executable) = install_fake_orca(script, "pagination");
+
+        let catalog = list_all_with_executable(executable.as_os_str()).expect("load full page");
+
+        assert_eq!(catalog.workspaces.len(), 2);
+        assert_eq!(catalog.workspaces[0].display_name, "first");
+        assert_eq!(catalog.workspaces[1].display_name, "last");
+        assert!(catalog.unresolved_host_ids.is_empty());
+        assert!(catalog.unverifiable_scope_host_ids.is_empty());
 
         std::fs::remove_dir_all(&dir).expect("remove test directory");
     }
@@ -698,6 +733,18 @@ esac
           }
         }"#;
         let (_, _, _, scope) = parse_catalog_details(null_scope).expect("parse null scope");
+        assert!(!scope.reported);
+
+        let partial_scope = br#"{
+          "ok": true,
+          "result": {
+            "worktrees": [],
+            "totalCount": 0,
+            "truncated": false,
+            "hostScope": {"hostIds": ["local"]}
+          }
+        }"#;
+        let (_, _, _, scope) = parse_catalog_details(partial_scope).expect("parse partial scope");
         assert!(!scope.reported);
     }
 
