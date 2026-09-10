@@ -7,6 +7,7 @@ use crate::agent::{status_tally, AgentStatus};
 use crate::input::InputMode;
 use crate::pane_slot::PaneSlot;
 use crate::sidebar::SidebarEntry;
+use crate::workspace_view::WorkspaceRow;
 use ratatui::layout::Rect;
 
 /// 一帧 TUI 所需的只读派生数据。
@@ -42,6 +43,8 @@ pub(crate) struct OverlayModel {
     pub(crate) settings_default_agent: String,
     pub(crate) settings_theme_name: String,
     pub(crate) dashboard_entries: Vec<(String, AgentStatus)>,
+    pub(crate) workspace_rows: Vec<WorkspaceRow>,
+    pub(crate) workspace_selected: usize,
 }
 
 impl RenderModel {
@@ -64,7 +67,14 @@ impl RenderModel {
             .map(|(i, slot)| SidebarEntry {
                 name: slot.name().to_string(),
                 state: slot.state().clone(),
-                branch: slot.branch().map(String::from),
+                branch: slot.branch().and_then(|branch| {
+                    let redundant = slot.workspace_id.is_some()
+                        && slot
+                            .name()
+                            .strip_suffix(branch)
+                            .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('/'));
+                    (!redundant).then(|| branch.to_owned())
+                }),
                 activity: slot.activity().cloned(),
                 focused: i == focus,
                 pinned: slot.pinned,

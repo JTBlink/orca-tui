@@ -73,6 +73,32 @@ impl OrcaWorkspace {
         label
     }
 
+    /// Optional secondary sidebar label. For ordinary local workspaces the
+    /// primary name already contains the branch (`repo/branch`), so omitting
+    /// the duplicate branch gives the fixed-width sidebar enough room to show
+    /// the complete workspace name. Host/archive annotations remain visible
+    /// because they are not encoded in the primary name.
+    #[must_use]
+    pub fn sidebar_detail(&self) -> Option<String> {
+        let detail = self.sidebar_branch();
+        let local_host = self
+            .host_id
+            .as_deref()
+            .map(|host| host == "local")
+            .unwrap_or(true);
+        if local_host
+            && !self.is_archived
+            && self
+                .sidebar_name()
+                .strip_suffix(&self.branch)
+                .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('/'))
+        {
+            None
+        } else {
+            Some(detail)
+        }
+    }
+
     /// Whether this row can be launched by a local PTY.
     #[must_use]
     pub fn is_local(&self) -> bool {
@@ -308,5 +334,41 @@ mod tests {
         };
         assert_eq!(row.sidebar_name(), "project/main");
         assert_eq!(row.sidebar_branch(), "main");
+    }
+
+    #[test]
+    fn sidebar_detail_omits_redundant_local_branch_but_keeps_annotations() {
+        let local = OrcaWorkspace {
+            id: "repo::/work/main".to_owned(),
+            path: PathBuf::from("/work/main"),
+            branch: "main".to_owned(),
+            display_name: "main".to_owned(),
+            repo_id: "repo".to_owned(),
+            project_id: Some("github:org/repo".to_owned()),
+            host_id: Some("local".to_owned()),
+            is_archived: false,
+            workspace_status: None,
+            is_main_worktree: true,
+        };
+        assert_eq!(local.sidebar_name(), "repo/main");
+        assert_eq!(local.sidebar_detail(), None);
+
+        let remote = OrcaWorkspace {
+            host_id: Some("build-host".to_owned()),
+            ..local.clone()
+        };
+        assert_eq!(
+            remote.sidebar_detail().as_deref(),
+            Some("main @ build-host")
+        );
+
+        let archived = OrcaWorkspace {
+            is_archived: true,
+            ..local
+        };
+        assert_eq!(
+            archived.sidebar_detail().as_deref(),
+            Some("main [archived]")
+        );
     }
 }

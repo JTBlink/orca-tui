@@ -43,4 +43,5 @@ pub mod ssh;
 pub mod sync;
 pub mod terminal_emu;
 pub mod toast;
+pub(crate) mod workspace_view;
 pub mod worktree;

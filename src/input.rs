@@ -20,6 +20,7 @@ pub(crate) enum InputMode {
     TasksRepo,
     TasksList,
     Settings,
+    Workspaces,
 }
 
 /// 键盘、鼠标和 modal 共享的瞬态 UI 状态集合。
@@ -39,6 +40,7 @@ pub struct InteractionState {
     pub(crate) tasks_selected: usize,
     pub(crate) tasks_error: Option<String>,
     pub(crate) settings_cursor: usize,
+    pub(crate) workspace_selected: usize,
 }
 
 impl Default for InteractionState {
@@ -58,6 +60,7 @@ impl Default for InteractionState {
             tasks_selected: 0,
             tasks_error: None,
             settings_cursor: 0,
+            workspace_selected: 0,
         }
     }
 }
@@ -90,6 +93,7 @@ pub(crate) enum InputCommand {
     OpenSpawn,
     ToggleSidebar,
     OpenSidebar,
+    OpenWorkspaces,
 }
 
 /// 将全局、Normal 和 Pane 模式的按键转换为语义命令。
@@ -127,6 +131,7 @@ pub(crate) fn reduce_key(mode: InputMode, key: KeyEvent) -> Option<InputCommand>
                 KeyCode::Char('n') => InputCommand::OpenSpawn,
                 KeyCode::Char('b') => InputCommand::ToggleSidebar,
                 KeyCode::Char('s') => InputCommand::OpenSidebar,
+                KeyCode::Char('w') => InputCommand::OpenWorkspaces,
                 _ => InputCommand::Noop,
             };
             Some(command)
@@ -173,6 +178,14 @@ mod tests {
         assert_eq!(
             reduce_key(InputMode::Pane, key(KeyCode::Char('z'), KeyModifiers::NONE)),
             Some(InputCommand::ToggleZoom)
+        );
+    }
+
+    #[test]
+    fn reducer_opens_workspace_inventory_from_pane_mode() {
+        assert_eq!(
+            reduce_key(InputMode::Pane, key(KeyCode::Char('w'), KeyModifiers::NONE)),
+            Some(InputCommand::OpenWorkspaces)
         );
     }
 }

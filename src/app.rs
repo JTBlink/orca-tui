@@ -57,6 +57,7 @@ use crate::scheduler::{FrameScheduler, TARGET_FRAME_60FPS};
 use crate::sidebar;
 use crate::ssh;
 use crate::terminal_emu::{MIN_COLS, MIN_ROWS};
+use crate::workspace_view::WorkspaceRow;
 use crate::worktree::{OwnedWorktrees, WorktreeManager};
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -114,6 +115,7 @@ const FOOTER_ACTIVITY: &str = " \u{2191}\u{2193} scroll activity \u{00B7} Esc: c
 const FOOTER_DASHBOARD: &str = " Esc: close ";
 const FOOTER_SIDEBAR: &str =
     " \u{2191}\u{2193} navigate \u{00B7} Enter: select \u{00B7} Esc: back ";
+const FOOTER_WORKSPACES: &str = " \u{2191}\u{2193}/j k: scroll workspaces \u{00B7} Esc: close ";
 const FOOTER_SPAWN_CUSTOM: &str =
     " type a command \u{00B7} Enter: spawn \u{00B7} Backspace \u{00B7} Esc: cancel ";
 const FOOTER_TASKS_REPO: &str =
@@ -558,12 +560,46 @@ impl<B: Backend> App<B> {
             .map(|workspace| crate::sidebar::SidebarEntry {
                 name: workspace.sidebar_name(),
                 state: AgentState::Idle,
-                branch: Some(workspace.sidebar_branch()),
+                branch: workspace.sidebar_detail(),
                 activity: None,
                 focused: false,
                 pinned: false,
             })
             .collect()
+    }
+
+    /// Build the complete workspace inventory used by the `w` overlay. When
+    /// the Orca catalog is unavailable, keep the overlay useful by exposing
+    /// the panes currently owned by this TUI as a local fallback inventory.
+    fn workspace_inventory_rows(&self) -> Vec<WorkspaceRow> {
+        if !self.workspace_catalog.is_empty() {
+            return self
+                .workspace_catalog
+                .iter()
+                .map(|workspace| WorkspaceRow {
+                    name: workspace.sidebar_name(),
+                    detail: workspace.sidebar_detail().unwrap_or_default(),
+                })
+                .collect();
+        }
+        self.panes
+            .iter()
+            .map(|slot| WorkspaceRow {
+                name: slot.name().to_owned(),
+                detail: slot
+                    .branch()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| slot.state().label().to_owned()),
+            })
+            .collect()
+    }
+
+    fn workspace_count(&self) -> usize {
+        if self.workspace_catalog.is_empty() {
+            self.panes.len()
+        } else {
+            self.workspace_catalog.len()
+        }
     }
 
     /// Attach a mobile-companion snapshot publisher (Feature 10). Once set,
@@ -1674,10 +1710,22 @@ impl<B: Backend> App<B> {
         // the visual separation that the margin/spacing previously gave.
         let total = Rect::new(0, 0, size.width, size.height);
 
+        // Derive the sidebar model before laying out panes so a long Orca
+        // workspace name can widen the sidebar enough to remain readable.
+        // The helper caps the expansion while preserving a usable pane area.
+        let catalog_entries = self.catalog_sidebar_entries();
+        let mut render_model =
+            RenderModel::from_slots_with_catalog(&self.panes, self.focus, &catalog_entries);
+
         // Reserve the left sidebar (Orca-style agent list with status dots +
         // live activity from OSC 9999). Hidden when sidebar_width is 0 or the
         // terminal is too narrow for panes to be usable.
-        let sidebar_w = self.config.layout.sidebar_width;
+        let sidebar_w = sidebar::recommended_width(
+            &render_model.sidebar_entries,
+            self.config.layout.sidebar_width,
+            total.width,
+            22,
+        );
         let show_sidebar = sidebar_w > 0 && !self.sidebar_hidden && total.width > sidebar_w + 22;
         let (sidebar_area, content_area) = if show_sidebar {
             // spacing(1) adds a 1-cell gap between the sidebar and the pane
@@ -1769,11 +1817,8 @@ impl<B: Backend> App<B> {
             }
         }
 
-        // Derive an immutable render model before borrowing panes mutably for
-        // viewport reconciliation and drawing.
-        let catalog_entries = self.catalog_sidebar_entries();
-        let mut render_model =
-            RenderModel::from_slots_with_catalog(&self.panes, self.focus, &catalog_entries);
+        // The render model was derived before layout so its workspace labels
+        // could participate in the sidebar-width decision above.
         if crate::debug_log::enabled() {
             let signature = (
                 self.panes.len(),
@@ -1807,6 +1852,7 @@ impl<B: Backend> App<B> {
                 InputMode::Activity => FOOTER_ACTIVITY,
                 InputMode::Dashboard => FOOTER_DASHBOARD,
                 InputMode::Sidebar => FOOTER_SIDEBAR,
+                InputMode::Workspaces => FOOTER_WORKSPACES,
                 InputMode::Normal => FOOTER_NORMAL,
             }
             .to_string()
@@ -1857,6 +1903,13 @@ impl<B: Backend> App<B> {
         // touches `self.sidebar_nav` (borrow-checker safety on the 60fps path).
         let sidebar_open = mode == InputMode::Sidebar;
         let sidebar_selected = self.sidebar_nav;
+        let workspace_open = mode == InputMode::Workspaces;
+        let workspace_rows = if workspace_open {
+            self.workspace_inventory_rows()
+        } else {
+            Vec::new()
+        };
+        let workspace_selected = self.workspace_selected;
         // Snapshot the Tasks view state (Phase 2) BEFORE the mutable `panes`
         // borrow so the draw closure never touches the tasks_* fields.
         let tasks_repo_open = mode == InputMode::TasksRepo;
@@ -1948,6 +2001,8 @@ impl<B: Backend> App<B> {
             settings_default_agent: settings_default_agent.clone(),
             settings_theme_name: settings_theme_name.clone(),
             dashboard_entries: dashboard_entries.clone(),
+            workspace_rows,
+            workspace_selected,
         };
         let panes = &mut self.panes;
         let theme = &self.config.theme;
@@ -2269,6 +2324,15 @@ impl<B: Backend> App<B> {
                 }
                 crate::overlay::render_lines(f, inner, lines, theme);
             }
+            if render_model.overlay.mode == InputMode::Workspaces {
+                crate::workspace_view::render_workspace_overlay(
+                    f,
+                    total,
+                    &render_model.overlay.workspace_rows,
+                    render_model.overlay.workspace_selected,
+                    theme,
+                );
+            }
             // Help overlay: full-screen keybindings reference.
             if show_help {
                 let pop = Rect::new(
@@ -2312,6 +2376,7 @@ impl<B: Backend> App<B> {
                     Line::from("  /         Jump palette (fuzzy-focus)"),
                     Line::from("  a         Activity timeline (overlay)"),
                     Line::from("  d         Agent dashboard (overlay)"),
+                    Line::from("  w         All Orca workspaces (scrollable)"),
                     Line::from("  ?         This help"),
                     Line::from("  Esc       Back to Normal"),
                     Line::raw(""),
@@ -2622,6 +2687,31 @@ impl<B: Backend> App<B> {
                 },
                 _ => {}
             },
+            InputMode::Workspaces => {
+                let count = self.workspace_count();
+                match key.code {
+                    KeyCode::Esc => self.mode = InputMode::Normal,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.workspace_selected = self.workspace_selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if count > 0 {
+                            self.workspace_selected =
+                                (self.workspace_selected + 1).min(count.saturating_sub(1));
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        self.workspace_selected = self.workspace_selected.saturating_sub(8);
+                    }
+                    KeyCode::PageDown => {
+                        if count > 0 {
+                            self.workspace_selected =
+                                (self.workspace_selected + 8).min(count.saturating_sub(1));
+                        }
+                    }
+                    _ => {}
+                }
+            }
             InputMode::SpawnCustom => match key.code {
                 KeyCode::Esc => self.mode = InputMode::Normal,
                 KeyCode::Enter => {
@@ -2691,6 +2781,10 @@ impl<B: Backend> App<B> {
             InputCommand::OpenSidebar => {
                 self.mode = InputMode::Sidebar;
                 self.sidebar_nav = 0;
+            }
+            InputCommand::OpenWorkspaces => {
+                self.mode = InputMode::Workspaces;
+                self.workspace_selected = 0;
             }
         }
     }
@@ -4405,6 +4499,34 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "repo-b/login");
         assert_eq!(rows[0].branch.as_deref(), Some("feature/login @ ssh-host"));
+    }
+
+    #[test]
+    fn workspace_inventory_overlay_renders_and_scrolls_complete_catalog() {
+        let mut app = App::for_test(Vec::new());
+        app.workspace_catalog = (0..20)
+            .map(|index| OrcaWorkspace {
+                id: format!("repo::{index}"),
+                path: PathBuf::from(format!("/workspace/{index}")),
+                branch: format!("feature-{index}"),
+                display_name: format!("workspace-{index}"),
+                repo_id: "repo".to_owned(),
+                project_id: None,
+                host_id: Some("local".to_owned()),
+                is_archived: false,
+                workspace_status: None,
+                is_main_worktree: false,
+            })
+            .collect();
+        app.mode = InputMode::Workspaces;
+        app.workspace_selected = 19;
+        app.render().expect("render workspace inventory");
+        let text = buffer_text(&app);
+        assert!(text.contains("Workspaces (20)"));
+        assert!(text.contains("workspace-19"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, InputMode::Normal);
     }
 
     #[test]

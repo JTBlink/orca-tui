@@ -151,6 +151,7 @@ Pane 模式：
 | `/` | 按名称快速跳转 |
 | `a` | Activity 时间线 |
 | `d` | Agent 状态看板 |
+| `w` | Orca 全部工作区清单（可滚动） |
 | `s` | Activity / Tasks / Settings 导航 |
 | `?` | 完整帮助 |
 | `Esc` | 返回普通模式 |

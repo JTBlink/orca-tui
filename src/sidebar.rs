@@ -47,6 +47,59 @@ pub struct SidebarEntry {
     pub pinned: bool,
 }
 
+/// Recommend a sidebar width that keeps the longest workspace/agent label
+/// readable while reserving a usable pane area on the right. The configured
+/// width remains the floor; the width is only expanded when the terminal can
+/// spare the requested space.
+#[must_use]
+pub fn recommended_width(
+    entries: &[SidebarEntry],
+    configured_width: u16,
+    terminal_width: u16,
+    min_content_width: u16,
+) -> u16 {
+    if configured_width == 0 {
+        return 0;
+    }
+    let required_inner = entries
+        .iter()
+        .map(|entry| {
+            let branch = visible_branch(entry);
+            let name = u16::try_from(disp_width(&entry.name)).unwrap_or(u16::MAX);
+            let detail = branch.map_or(0, |value| {
+                u16::try_from(disp_width(value)).unwrap_or(u16::MAX)
+            });
+            // Marker + status dot + separator + a gap before the right-side
+            // detail, plus the two border cells outside the inner area.
+            name.saturating_add(4).saturating_add(if detail > 0 {
+                detail.saturating_add(1)
+            } else {
+                0
+            })
+        })
+        .max()
+        .unwrap_or(0);
+    let desired = configured_width.max(required_inner.saturating_add(2));
+    let max_sidebar = terminal_width.saturating_sub(min_content_width.saturating_add(1));
+    if max_sidebar < configured_width {
+        configured_width
+    } else {
+        desired.min(max_sidebar)
+    }
+}
+
+fn visible_branch(entry: &SidebarEntry) -> Option<&str> {
+    let branch = entry
+        .branch
+        .as_deref()
+        .or_else(|| entry.activity.as_ref().and_then(|a| a.model.as_deref()))?;
+    let redundant = entry
+        .name
+        .strip_suffix(branch)
+        .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('/'));
+    (!redundant).then_some(branch)
+}
+
 /// Render the sidebar into a region of `frame`.
 ///
 /// Layout (top to bottom): the sidebar sits inside a fully **bordered** panel
@@ -334,10 +387,7 @@ fn render_entry_row(
 
     // Branch / model: right-aligned, dim. Rendered first so left-side content
     // truncates before it instead of running underneath it.
-    let branch: Option<&str> = entry
-        .branch
-        .as_deref()
-        .or_else(|| entry.activity.as_ref().and_then(|a| a.model.as_deref()));
+    let branch = visible_branch(entry);
     let bw = u16::try_from(branch.map_or(0, disp_width)).unwrap_or(0);
     let left_end = if bw > 0 && bw.saturating_add(2) <= width {
         let bx = right.saturating_sub(bw);
@@ -483,10 +533,7 @@ fn render_entry_two_line(
 
     // Branch / model: right-aligned on line 1 (dim). Painted first so left-
     // side content truncates before reaching it.
-    let branch: Option<&str> = entry
-        .branch
-        .as_deref()
-        .or_else(|| entry.activity.as_ref().and_then(|a| a.model.as_deref()));
+    let branch = visible_branch(entry);
     let bw = u16::try_from(branch.map_or(0, disp_width)).unwrap_or(0);
     let left_end = if bw > 0 && bw.saturating_add(2) <= width {
         let bx = right.saturating_sub(bw);
@@ -658,6 +705,41 @@ mod tests {
             "working/waiting dot missing:\n{text}"
         );
         assert!(text.contains('\u{2713}'), "done dot missing:\n{text}");
+    }
+
+    #[test]
+    fn recommended_width_expands_for_long_workspace_names() {
+        let entries = vec![SidebarEntry {
+            name: "input-pc/feat/arch-refact-mac".to_owned(),
+            state: AgentState::Idle,
+            branch: None,
+            activity: None,
+            focused: false,
+            pinned: false,
+        }];
+        let width = recommended_width(&entries, 26, 80, 22);
+        assert!(width > 26, "long workspace name should widen the sidebar");
+        assert!(width + 1 + 22 <= 80, "pane area remains usable");
+    }
+
+    #[test]
+    fn render_sidebar_does_not_repeat_workspace_branch() {
+        let entries = vec![SidebarEntry {
+            name: "repo/feature".to_owned(),
+            state: AgentState::Idle,
+            branch: Some("feature".to_owned()),
+            activity: None,
+            focused: false,
+            pinned: false,
+        }];
+        let backend = TestBackend::new(32, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ThemeConfig::default();
+        terminal
+            .draw(|f| render_sidebar(f, f.area(), &entries, &theme, None))
+            .expect("draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert_eq!(text.matches("feature").count(), 1);
     }
 
     #[test]

@@ -38,6 +38,7 @@ Orca daemon：Orca daemon --control/stream sockets-->
 | `daemon_server.rs` | 内置 daemon、attach 协议和会话持有 |
 | `orca_daemon.rs` | Orca GUI daemon v36 客户端 |
 | `orca_workspaces.rs` | Orca CLI 全局 workspace catalog 读取、完整性校验和降级 |
+| `workspace_view.rs` | 完整 workspace inventory overlay 与窗口化滚动 |
 | `worktree.rs` | Git worktree 创建、分支和生命周期清理 |
 | `debug_log.rs` | 可选的脱敏诊断日志（worktree/sidebar 拓扑与终端探针） |
 | `coordinator.rs` | 顺序/并行任务依赖和派发 |
@@ -114,8 +115,10 @@ reconnect、pin 或 status 的平行状态字段。新增字段必须先归入 `
 与 GitHub 请求不属于交互状态，handler 不直接执行阻塞 I/O。
 
 渲染边界由 `render_model::RenderModel` 负责从 slot 派生 sidebar entries、状态 tally，并生成
-一次性的 `OverlayModel`（Jump、Spawn、Tasks、Settings、Activity、Dashboard 等 modal 的只读
-视图数据），再交给 ratatui 绘制。daemon 控制面由 `daemon_connection::DaemonConnection` 包装，输入写入
+一次性的 `OverlayModel`（Jump、Spawn、Tasks、Settings、Activity、Dashboard、完整 Workspaces
+清单等 modal 的只读视图数据），再交给 ratatui 绘制。`w` 打开可滚动的全量 workspace inventory，
+所以 sidebar 的视口窗口化不会静默丢失前面的 workspace。daemon 控制面由
+`daemon_connection::DaemonConnection` 包装，输入写入
 通过专用 writer 线程排队，避免 UI loop 等待 RPC。
 动态 session 创建同样通过短生命周期 worker connection 执行；占位 pane 在结果返回前保持
 Idle，成功后再注入 snapshot 并注册稳定 session id，失败则转为 Failed/toast。

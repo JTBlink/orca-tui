@@ -247,7 +247,13 @@ fn dispatch_command(command: Command) -> Result<()> {
                 }
                 prepare_all_worktree_specs_with_catalog(command, cwd.as_deref(), remote.as_deref())?
             } else {
-                (prepare_run_specs(command, remote.as_deref())?, Vec::new())
+                // The explicit command controls pane creation, not workspace
+                // visibility: keep the full Orca catalog in the sidebar and
+                // the `w` inventory view for every run mode.
+                (
+                    prepare_run_specs(command, remote.as_deref())?,
+                    orca_workspaces::list_all().unwrap_or_default(),
+                )
             };
 
             let mut app =
@@ -592,6 +598,7 @@ fn run_attach(socket_path: &Path) -> Result<()> {
     use crate::layout::split_panes;
     use crate::pane::Pane;
     use crate::sidebar::{self, SidebarEntry};
+    use crate::workspace_view::{self, WorkspaceRow};
     use base64::{engine::general_purpose, Engine as _};
     use crossterm::event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -625,6 +632,13 @@ fn run_attach(socket_path: &Path) -> Result<()> {
             Vec::new()
         }
     };
+    let workspace_rows: Vec<WorkspaceRow> = workspace_catalog
+        .iter()
+        .map(|workspace| WorkspaceRow {
+            name: workspace.sidebar_name(),
+            detail: workspace.sidebar_detail().unwrap_or_default(),
+        })
+        .collect();
     if crate::debug_log::enabled() {
         crate::debug_log::append(format_args!(
             "{} attach session_count={} catalog_rows={} sidebar_source=daemon_sessions+orca_catalog",
@@ -652,9 +666,10 @@ fn run_attach(socket_path: &Path) -> Result<()> {
         .collect();
 
     let mut focus: usize = 0;
+    let mut workspace_open = false;
+    let mut workspace_selected: usize = 0;
     let config = crate::config::Config::default();
     let theme = &config.theme;
-    let sidebar_width = config.layout.sidebar_width;
 
     // Reader thread: reads NDJSON from the daemon, feeds output to a channel.
     let reader_stream = client.try_clone_stream()?;
@@ -732,7 +747,7 @@ fn run_attach(socket_path: &Path) -> Result<()> {
             sidebar_entries.extend(workspace_catalog.iter().map(|workspace| SidebarEntry {
                 name: workspace.sidebar_name(),
                 state: crate::agent::AgentState::Idle,
-                branch: Some(workspace.sidebar_branch()),
+                branch: workspace.sidebar_detail(),
                 activity: None,
                 focused: false,
                 pinned: false,
@@ -740,10 +755,17 @@ fn run_attach(socket_path: &Path) -> Result<()> {
             if let Some(entry) = sidebar_entries.get_mut(focus) {
                 entry.focused = true;
             }
+            let configured_sidebar_width = config.layout.sidebar_width;
 
             // Render.
             terminal.draw(|f| {
                 let total = f.area();
+                let sidebar_width = sidebar::recommended_width(
+                    &sidebar_entries,
+                    configured_sidebar_width,
+                    total.width,
+                    22,
+                );
                 let show_sidebar =
                     sidebar_width > 0 && total.width > sidebar_width.saturating_add(22);
                 let (sidebar_area, pane_area) = if show_sidebar {
@@ -771,6 +793,15 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                     let pane_area = rects.get(i).copied().unwrap_or_default();
                     pane.render(f, pane_area, i == focus, theme);
                 }
+                if workspace_open {
+                    workspace_view::render_workspace_overlay(
+                        f,
+                        total,
+                        &workspace_rows,
+                        workspace_selected,
+                        theme,
+                    );
+                }
             })?;
 
             // Poll for input (10ms timeout — keeps the UI responsive to daemon output).
@@ -778,8 +809,44 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                 let ev = event::read()?;
                 if let Event::Key(key) = ev {
                     if key.kind == KeyEventKind::Press {
+                        // Ctrl+Q is global, including while the workspace
+                        // inventory is open. Handle it before modal-specific
+                        // navigation so attach clients can always detach.
+                        if key.code == KeyCode::Char('q')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            break;
+                        }
+                        if workspace_open {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('w') => workspace_open = false,
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    workspace_selected = workspace_selected.saturating_sub(1);
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    if !workspace_rows.is_empty() {
+                                        workspace_selected = (workspace_selected + 1)
+                                            .min(workspace_rows.len().saturating_sub(1));
+                                    }
+                                }
+                                KeyCode::PageUp => {
+                                    workspace_selected = workspace_selected.saturating_sub(8);
+                                }
+                                KeyCode::PageDown => {
+                                    if !workspace_rows.is_empty() {
+                                        workspace_selected = (workspace_selected + 8)
+                                            .min(workspace_rows.len().saturating_sub(1));
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                         match (key.code, key.modifiers) {
-                            (KeyCode::Char('q'), KeyModifiers::CONTROL) => break,
+                            (KeyCode::Char('w'), m) if !m.contains(KeyModifiers::CONTROL) => {
+                                workspace_open = true;
+                                workspace_selected = 0;
+                            }
                             (KeyCode::Tab, _) => {
                                 if !panes.is_empty() {
                                     focus = (focus + 1) % panes.len();
