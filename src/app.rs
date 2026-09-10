@@ -192,6 +192,10 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// Local rows are represented by their running pane and are filtered out
     /// at render time to avoid duplicate sidebar entries.
     workspace_catalog: Vec<OrcaWorkspace>,
+    /// Runtime hosts that Orca reported but this CLI could not query. Keeping
+    /// them separate lets the inventory explain why a remote catalog may be
+    /// incomplete instead of silently presenting a partial list as complete.
+    workspace_unresolved_hosts: Vec<String>,
     /// Feature 5: adaptive frame scheduler — throttles rendering to a 60fps
     /// budget, skips frames when behind (backpressure), and backs off the poll
     /// interval when idle (no input/agent output) to save CPU.
@@ -488,6 +492,7 @@ impl App {
             raw_mode_active: false,
             worktrees: owned,
             workspace_catalog,
+            workspace_unresolved_hosts: Vec::new(),
             scheduler: FrameScheduler::new(TARGET_FRAME_60FPS, Instant::now()),
             snapshot_tx: None,
             coordinator: None,
@@ -546,6 +551,13 @@ impl<B: Backend> App<B> {
     /// frame already contains every Orca workspace.
     pub fn set_workspace_catalog(&mut self, catalog: Vec<OrcaWorkspace>) {
         self.workspace_catalog = catalog;
+    }
+
+    /// Record host-scope gaps reported by Orca's workspace listing. The rows
+    /// already loaded remain visible; the `w` inventory adds an explicit
+    /// warning for each unresolved host.
+    pub fn set_workspace_catalog_scope(&mut self, unresolved_hosts: Vec<String>) {
+        self.workspace_unresolved_hosts = unresolved_hosts;
     }
 
     fn catalog_sidebar_entries(&self) -> Vec<crate::sidebar::SidebarEntry> {
@@ -1910,6 +1922,7 @@ impl<B: Backend> App<B> {
             Vec::new()
         };
         let workspace_selected = self.workspace_selected;
+        let workspace_unresolved_hosts = self.workspace_unresolved_hosts.clone();
         // Snapshot the Tasks view state (Phase 2) BEFORE the mutable `panes`
         // borrow so the draw closure never touches the tasks_* fields.
         let tasks_repo_open = mode == InputMode::TasksRepo;
@@ -2003,6 +2016,7 @@ impl<B: Backend> App<B> {
             dashboard_entries: dashboard_entries.clone(),
             workspace_rows,
             workspace_selected,
+            workspace_unresolved_hosts,
         };
         let panes = &mut self.panes;
         let theme = &self.config.theme;
@@ -2330,6 +2344,7 @@ impl<B: Backend> App<B> {
                     total,
                     &render_model.overlay.workspace_rows,
                     render_model.overlay.workspace_selected,
+                    &render_model.overlay.workspace_unresolved_hosts,
                     theme,
                 );
             }
@@ -3646,6 +3661,7 @@ mod tests {
                 raw_mode_active: false,
                 worktrees: None,
                 workspace_catalog: Vec::new(),
+                workspace_unresolved_hosts: Vec::new(),
                 scheduler: FrameScheduler::new(TARGET_FRAME_60FPS, Instant::now()),
                 snapshot_tx: None,
                 coordinator: None,

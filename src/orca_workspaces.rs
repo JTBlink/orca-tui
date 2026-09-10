@@ -5,6 +5,7 @@
 //! repository containing the current directory, so it is deliberately kept as
 //! a fallback rather than treated as the complete workspace inventory.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -13,6 +14,24 @@ use serde_json::Value;
 
 const INITIAL_LIMIT: usize = 10_000;
 const MAX_LIMIT: usize = 100_000;
+
+/// Host coverage reported by Orca for one listing page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogScope {
+    /// Hosts whose rows are represented by this page.
+    pub covered_host_ids: Vec<String>,
+    /// Hosts that Orca knows about but did not include in this page.
+    pub omitted_host_ids: Vec<String>,
+}
+
+/// Complete catalog result, including hosts that could not be queried from the
+/// current machine. The rows are still useful, but callers must surface the
+/// unresolved host list instead of claiming that the catalog is exhaustive.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrcaWorkspaceCatalog {
+    pub workspaces: Vec<OrcaWorkspace>,
+    pub unresolved_host_ids: Vec<String>,
+}
 
 /// One row returned by `orca worktree list --json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,19 +136,100 @@ impl OrcaWorkspace {
 /// reports a truncated page, the query is retried with a larger limit and then
 /// fails instead of silently presenting an incomplete catalog.
 pub fn list_all() -> Result<Vec<OrcaWorkspace>> {
+    Ok(list_all_with_scope()?.workspaces)
+}
+
+/// Query every host that the local Orca CLI can reach.
+///
+/// `orca worktree list` intentionally reports host coverage. A successful
+/// local page can therefore still omit paired runtime hosts. We follow those
+/// `runtime:<id>` entries with `--environment <id>` requests and retain any
+/// host that cannot be reached as an explicit completeness warning.
+pub fn list_all_with_scope() -> Result<OrcaWorkspaceCatalog> {
     if std::env::var_os("ORCA_TUI_DISABLE_ORCA_CATALOG").is_some() {
         bail!("Orca workspace catalog disabled by ORCA_TUI_DISABLE_ORCA_CATALOG");
     }
 
+    let (initial, initial_scope) = query_complete(None)?;
+    let mut workspaces = initial;
+    let mut unresolved = Vec::new();
+    let mut visited = HashSet::new();
+    let mut pending = initial_scope.omitted_host_ids;
+    let paired_environment_ids = if pending.iter().any(|host| host.starts_with("runtime:")) {
+        paired_environment_ids()
+    } else {
+        HashSet::new()
+    };
+
+    while let Some(host_id) = pending.pop() {
+        if !visited.insert(host_id.clone()) {
+            continue;
+        }
+        let Some(environment_id) = host_id.strip_prefix("runtime:") else {
+            // SSH hosts require a pairing code or a configured host selector;
+            // the unscoped worktree command cannot invent either one.
+            unresolved.push(host_id);
+            continue;
+        };
+        if !paired_environment_ids.contains(environment_id) {
+            unresolved.push(host_id);
+            continue;
+        }
+        match query_complete(Some(environment_id)) {
+            Ok((rows, scope)) => {
+                workspaces.extend(rows);
+                pending.extend(scope.omitted_host_ids);
+            }
+            Err(_) => unresolved.push(host_id),
+        }
+    }
+
+    // A workspace id is stable across repeated host queries. Deduplicate rows
+    // while preserving Orca's ordering (local rows first, then remote rows).
+    let mut seen = HashSet::new();
+    workspaces.retain(|workspace| seen.insert(workspace.id.clone()));
+    unresolved.sort();
+    unresolved.dedup();
+    Ok(OrcaWorkspaceCatalog {
+        workspaces,
+        unresolved_host_ids: unresolved,
+    })
+}
+
+fn paired_environment_ids() -> HashSet<String> {
+    let executable = std::env::var_os("ORCA_CLI").unwrap_or_else(|| "orca".into());
+    let Ok(output) = Command::new(executable)
+        .args(["environment", "list", "--json"])
+        .output()
+    else {
+        return HashSet::new();
+    };
+    if !output.status.success() {
+        return HashSet::new();
+    }
+    let Ok(root) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return HashSet::new();
+    };
+    root.get("result")
+        .and_then(|result| result.get("environments"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|environment| environment.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn query_complete(environment: Option<&str>) -> Result<(Vec<OrcaWorkspace>, CatalogScope)> {
     let mut limit = INITIAL_LIMIT;
     loop {
-        let (workspaces, total_count, truncated) = query(limit)?;
+        let (workspaces, total_count, truncated, scope) = query(limit, environment)?;
         let complete = !truncated
             && total_count
                 .map(|total| workspaces.len() >= total)
                 .unwrap_or(true);
         if complete {
-            return Ok(workspaces);
+            return Ok((workspaces, scope));
         }
         if limit >= MAX_LIMIT {
             bail!(
@@ -142,18 +242,23 @@ pub fn list_all() -> Result<Vec<OrcaWorkspace>> {
     }
 }
 
-fn query(limit: usize) -> Result<(Vec<OrcaWorkspace>, Option<usize>, bool)> {
+fn query(
+    limit: usize,
+    environment: Option<&str>,
+) -> Result<(Vec<OrcaWorkspace>, Option<usize>, bool, CatalogScope)> {
     let executable = std::env::var_os("ORCA_CLI").unwrap_or_else(|| "orca".into());
-    let output = Command::new(&executable)
-        .args(["worktree", "list", "--json", "--limit"])
-        .arg(limit.to_string())
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to run {} worktree list",
-                executable.to_string_lossy()
-            )
-        })?;
+    let mut command = Command::new(&executable);
+    command.args(["worktree", "list", "--json", "--limit"]);
+    command.arg(limit.to_string());
+    if let Some(environment) = environment {
+        command.args(["--environment", environment]);
+    }
+    let output = command.output().with_context(|| {
+        format!(
+            "failed to run {} worktree list",
+            executable.to_string_lossy()
+        )
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         bail!(
@@ -166,12 +271,19 @@ fn query(limit: usize) -> Result<(Vec<OrcaWorkspace>, Option<usize>, bool)> {
             }
         );
     }
-    parse_catalog(&output.stdout)
+    parse_catalog_details(&output.stdout)
 }
 
 /// Parse an Orca JSON envelope. Kept separate from process execution so the
 /// response shape and completeness rules are unit-testable without a daemon.
 pub fn parse_catalog(bytes: &[u8]) -> Result<(Vec<OrcaWorkspace>, Option<usize>, bool)> {
+    let (workspaces, total_count, truncated, _) = parse_catalog_details(bytes)?;
+    Ok((workspaces, total_count, truncated))
+}
+
+fn parse_catalog_details(
+    bytes: &[u8],
+) -> Result<(Vec<OrcaWorkspace>, Option<usize>, bool, CatalogScope)> {
     let root: Value = serde_json::from_slice(bytes).context("parsing Orca workspace JSON")?;
     if root.get("ok").and_then(Value::as_bool) == Some(false) {
         let message = root
@@ -202,7 +314,32 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<(Vec<OrcaWorkspace>, Option<usize>,
         .get("truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    Ok((workspaces, total_count, truncated))
+    let host_scope = result.get("hostScope");
+    let scope = CatalogScope {
+        covered_host_ids: host_scope
+            .and_then(|scope| scope.get("hostIds"))
+            .and_then(Value::as_array)
+            .map(|hosts| {
+                hosts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        omitted_host_ids: host_scope
+            .and_then(|scope| scope.get("omittedHostIds"))
+            .and_then(Value::as_array)
+            .map(|hosts| {
+                hosts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    Ok((workspaces, total_count, truncated, scope))
 }
 
 fn parse_workspace(row: &Value) -> Result<OrcaWorkspace> {
@@ -226,7 +363,10 @@ fn parse_workspace(row: &Value) -> Result<OrcaWorkspace> {
         display_name,
         repo_id,
         project_id: optional_string(row, "projectId"),
-        host_id: optional_string(row, "hostId"),
+        host_id: optional_string(row, "hostId").or_else(|| {
+            row.get("identity")
+                .and_then(|identity| optional_string(identity, "executionHostId"))
+        }),
         is_archived: row
             .get("isArchived")
             .and_then(Value::as_bool)
@@ -303,6 +443,35 @@ mod tests {
         assert_eq!(rows[1].branch, "feature/login");
         assert_eq!(rows[1].host_id.as_deref(), Some("ssh-host"));
         assert!(!rows[1].is_archived);
+    }
+
+    #[test]
+    fn parse_catalog_reads_host_scope_and_identity_fallback() {
+        let json = br#"{
+          "ok": true,
+          "result": {
+            "totalCount": 1,
+            "truncated": false,
+            "hostScope": {
+              "hostIds": ["local"],
+              "omittedHostIds": ["runtime:env-1"]
+            },
+            "worktrees": [{
+              "id": "repo::/work/main",
+              "path": "/work/main",
+              "branch": "main",
+              "displayName": "main",
+              "identity": {"executionHostId": "runtime:env-1"}
+            }]
+          }
+        }"#;
+        let (rows, total, truncated) = parse_catalog(json).expect("parse catalog");
+        assert_eq!(rows[0].host_id.as_deref(), Some("runtime:env-1"));
+        assert_eq!(total, Some(1));
+        assert!(!truncated);
+        let (_, _, _, scope) = parse_catalog_details(json).expect("parse scope");
+        assert_eq!(scope.covered_host_ids, vec!["local"]);
+        assert_eq!(scope.omitted_host_ids, vec!["runtime:env-1"]);
     }
 
     #[test]

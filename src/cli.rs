@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 use crate::agent::{AgentKind, AgentSpec};
 use crate::app::App;
 use crate::integrations::{self, RepoRef};
-use crate::orca_workspaces::{self, OrcaWorkspace};
+use crate::orca_workspaces::{self, OrcaWorkspace, OrcaWorkspaceCatalog};
 use crate::ssh::SshTarget;
 use crate::worktree::WorktreeManager;
 use crate::{coordinator, mobile};
@@ -250,14 +250,17 @@ fn dispatch_command(command: Command) -> Result<()> {
                 // The explicit command controls pane creation, not workspace
                 // visibility: keep the full Orca catalog in the sidebar and
                 // the `w` inventory view for every run mode.
-                (
-                    prepare_run_specs(command, remote.as_deref())?,
-                    orca_workspaces::list_all().unwrap_or_default(),
-                )
+                let catalog = orca_workspaces::list_all_with_scope().unwrap_or_default();
+                (prepare_run_specs(command, remote.as_deref())?, catalog)
             };
 
-            let mut app =
-                App::spawn_agents_with_catalog(specs, cwd.as_deref(), worktree, workspace_catalog)?;
+            let mut app = App::spawn_agents_with_catalog(
+                specs,
+                cwd.as_deref(),
+                worktree,
+                workspace_catalog.workspaces,
+            )?;
+            app.set_workspace_catalog_scope(workspace_catalog.unresolved_host_ids);
 
             // Try to connect to an Orca GUI daemon (--daemon). Falls back to
             // standalone silently if no daemon is found; shows a toast if a
@@ -485,7 +488,7 @@ fn prepare_all_worktree_specs_with_catalog(
     command: Vec<String>,
     cwd: Option<&Path>,
     remote: Option<&str>,
-) -> Result<(Vec<AgentSpec>, Vec<OrcaWorkspace>)> {
+) -> Result<(Vec<AgentSpec>, OrcaWorkspaceCatalog)> {
     if remote.is_some() {
         anyhow::bail!("--all-worktrees cannot be combined with --remote");
     }
@@ -517,13 +520,20 @@ fn prepare_all_worktree_specs_with_catalog(
     let base = cwd
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    if let Ok(catalog) = orca_workspaces::list_all() {
-        if !catalog.is_empty() {
-            let specs = catalog
+    if let Ok(catalog) = orca_workspaces::list_all_with_scope() {
+        if !catalog.workspaces.is_empty() || !catalog.unresolved_host_ids.is_empty() {
+            let mut specs = catalog
+                .workspaces
                 .iter()
                 .filter(|workspace| workspace.is_local() && !workspace.is_archived)
                 .map(|workspace| agent_spec_for_workspace(&command, workspace))
                 .collect::<Vec<_>>();
+            // Keep the TUI alive with a local fallback pane when Orca only
+            // reported inaccessible hosts. The inventory still carries the
+            // unresolved host warning instead of dropping the catalog state.
+            if specs.is_empty() {
+                specs.push(AgentSpec::from_command(command.clone()));
+            }
             return Ok((specs, catalog));
         }
     }
@@ -532,14 +542,22 @@ fn prepare_all_worktree_specs_with_catalog(
     // catalog command is unavailable or disconnected.
     let manager = match WorktreeManager::open(&base) {
         Ok(manager) => manager,
-        Err(_) => return Ok((vec![AgentSpec::from_command(command)], Vec::new())),
+        Err(_) => {
+            return Ok((
+                vec![AgentSpec::from_command(command)],
+                OrcaWorkspaceCatalog::default(),
+            ))
+        }
     };
     let worktrees = manager.list_registered()?;
     if worktrees.is_empty() {
-        return Ok((vec![AgentSpec::from_command(command)], Vec::new()));
+        return Ok((
+            vec![AgentSpec::from_command(command)],
+            OrcaWorkspaceCatalog::default(),
+        ));
     }
 
-    let catalog = worktrees
+    let workspaces = worktrees
         .into_iter()
         .map(|worktree| OrcaWorkspace {
             id: worktree.path.display().to_string(),
@@ -554,11 +572,17 @@ fn prepare_all_worktree_specs_with_catalog(
             is_main_worktree: false,
         })
         .collect::<Vec<_>>();
-    let specs = catalog
+    let specs = workspaces
         .iter()
         .map(|workspace| agent_spec_for_workspace(&command, workspace))
         .collect();
-    Ok((specs, catalog))
+    Ok((
+        specs,
+        OrcaWorkspaceCatalog {
+            workspaces,
+            unresolved_host_ids: Vec::new(),
+        },
+    ))
 }
 
 fn agent_spec_for_workspace(command: &[String], workspace: &OrcaWorkspace) -> AgentSpec {
@@ -619,8 +643,8 @@ fn run_attach(socket_path: &Path) -> Result<()> {
     // global workspace catalog separately so an attach client still shows
     // every workspace across repositories and execution hosts, including
     // remote/archived rows that do not have a local PTY in this daemon.
-    let workspace_catalog = match orca_workspaces::list_all() {
-        Ok(catalog) => catalog,
+    let (workspace_catalog, unresolved_host_ids) = match orca_workspaces::list_all_with_scope() {
+        Ok(catalog) => (catalog.workspaces, catalog.unresolved_host_ids),
         Err(err) => {
             if crate::debug_log::enabled() {
                 crate::debug_log::append(format_args!(
@@ -629,7 +653,7 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                     crate::debug_log::classify_error(err.as_ref())
                 ));
             }
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
     };
     let workspace_rows: Vec<WorkspaceRow> = workspace_catalog
@@ -799,6 +823,7 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                         total,
                         &workspace_rows,
                         workspace_selected,
+                        &unresolved_host_ids,
                         theme,
                     );
                 }

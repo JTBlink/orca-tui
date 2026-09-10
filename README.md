@@ -247,14 +247,17 @@ orca worktree ps --json
 orca worktree current --json
 ```
 
-其中 `worktree list` 返回所有已登记工作区，`worktree ps` 额外汇总
-终端存活和 agent 状态；两者都可能包含多个 repo 和 host。`worktree current`
+其中 `worktree list` 返回当前 Orca CLI 能覆盖的已登记工作区，结果中的
+`hostScope.omittedHostIds` 表示尚未覆盖的运行时主机；`worktree ps` 额外汇总
+终端存活和 agent 状态。两者都可能包含多个 repo 和 host。`worktree current`
 只解析当前目录对应的一行。
 
 默认启动和 `orca-tui run --all-worktrees` 会优先读取
-`orca worktree list --json` 的完整 catalog，因此可以同时显示多个 repo、多个 host、
-远程和 archived workspace。当前机器上能访问的 local checkout 会启动 pane；远程或不可访问
-的 workspace 仍会以只读条目显示，不会把远程路径误当作本地 cwd。Orca CLI 不可用时才回退
+`orca worktree list --json` 的 catalog，并继续查询 Orca 报告的可达 runtime host，因此可以
+同时显示多个 repo、多个 host、远程和 archived workspace。当前机器上能访问的 local
+checkout 会启动 pane；远程或不可访问的 workspace 仍会以只读条目显示，不会把远程路径误
+当作本地 cwd。若 Orca 报告了当前 CLI 无法访问的 host，`w` 清单会明确显示
+`not covered`，不会把部分结果伪装成完整目录。Orca CLI 不可用时才回退
 到当前 Git 仓库的 `git worktree list`。`--worktree` 仍是本地会话级隔离：只创建本次运行的
 `.orca-worktrees/`，退出时清理。`orca-tui attach` 会把 daemon session 与同一份全局
 workspace catalog 并列显示，但不会把 daemon session 当成 workspace catalog。开启

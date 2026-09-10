@@ -27,6 +27,7 @@ pub(crate) fn render_workspace_overlay(
     total: Rect,
     rows: &[WorkspaceRow],
     selected: usize,
+    unresolved_hosts: &[String],
     theme: &ThemeConfig,
 ) {
     let pop = crate::overlay::centered_rect(
@@ -34,7 +35,15 @@ pub(crate) fn render_workspace_overlay(
         total.width.saturating_sub(4).max(40),
         total.height.saturating_sub(2).max(8),
     );
-    let title = format!(" Workspaces ({}) · ↑↓/j k scroll · Esc close ", rows.len());
+    let title = if unresolved_hosts.is_empty() {
+        format!(" Workspaces ({}) · ↑↓/j k scroll · Esc close ", rows.len())
+    } else {
+        format!(
+            " Workspaces ({}) · ⚠ {} host(s) unavailable · Esc close ",
+            rows.len(),
+            unresolved_hosts.len()
+        )
+    };
     let inner = crate::overlay::begin_popup(frame, pop, Line::from(title), theme);
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -51,12 +60,17 @@ pub(crate) fn render_workspace_overlay(
         return;
     }
 
-    // Reserve one line for the indicator whenever the list overflows. This
-    // keeps the indicator visible without hiding the selected row.
-    let has_overflow = rows.len() > usize::from(inner.height);
+    // Reserve one line for the host-scope warning and one for the indicator
+    // whenever needed. This keeps completeness state visible without hiding
+    // the selected row.
+    let warning_rows = usize::from(!unresolved_hosts.is_empty());
+    let has_overflow = rows.len()
+        > usize::from(inner.height)
+            .saturating_sub(warning_rows)
+            .max(1);
     let indicator_rows = usize::from(has_overflow);
     let visible = usize::from(inner.height)
-        .saturating_sub(indicator_rows)
+        .saturating_sub(indicator_rows + warning_rows)
         .max(1);
     let selected = selected.min(rows.len().saturating_sub(1));
     let max_start = rows.len().saturating_sub(visible);
@@ -99,6 +113,14 @@ pub(crate) fn render_workspace_overlay(
         lines.push(Line::from(indicator).style(Style::default().fg(theme.muted())));
     }
 
+    if !unresolved_hosts.is_empty() {
+        let hosts = unresolved_hosts.join(", ");
+        lines.push(
+            Line::from(format!(" ⚠ not covered: {hosts}"))
+                .style(Style::default().fg(theme.error())),
+        );
+    }
+
     crate::overlay::render_lines(frame, inner, lines, theme);
 }
 
@@ -131,11 +153,37 @@ mod tests {
             .collect::<Vec<_>>();
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
         terminal
-            .draw(|f| render_workspace_overlay(f, f.area(), &rows, 19, &ThemeConfig::default()))
+            .draw(|f| {
+                render_workspace_overlay(f, f.area(), &rows, 19, &[], &ThemeConfig::default())
+            })
             .expect("draw");
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("workspace-19"));
         assert!(text.contains("↑ top") || text.contains("↑↓ more"));
         assert!(text.contains("Workspaces (20)"));
+    }
+
+    #[test]
+    fn workspace_overlay_discloses_unavailable_hosts() {
+        let rows = vec![WorkspaceRow {
+            name: "local/main".to_owned(),
+            detail: String::new(),
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        terminal
+            .draw(|f| {
+                render_workspace_overlay(
+                    f,
+                    f.area(),
+                    &rows,
+                    0,
+                    &["runtime:remote-1".to_owned()],
+                    &ThemeConfig::default(),
+                )
+            })
+            .expect("draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("not covered: runtime:remote-1"));
+        assert!(text.contains("host(s) unavailable"));
     }
 }

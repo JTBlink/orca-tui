@@ -14,6 +14,13 @@ use crate::config::ThemeConfig;
 /// 在总区域中央生成一个有上下限的 popup 矩形。
 #[must_use]
 pub(crate) fn centered_rect(total: Rect, width: u16, height: u16) -> Rect {
+    // Ratatui buffers can briefly report a zero-sized terminal during a PTY
+    // resize or before a headless terminal has published its initial size.
+    // Returning a zero-sized rectangle keeps popup callers inside the buffer;
+    // clamping to 1 here would make `Clear` index (0, 0) in an empty buffer.
+    if total.width == 0 || total.height == 0 {
+        return Rect::new(total.x, total.y, 0, 0);
+    }
     let width = total.width.min(width).max(1);
     let height = total.height.min(height).max(1);
     Rect::new(
@@ -31,6 +38,9 @@ pub(crate) fn begin_popup(
     title: Line<'static>,
     theme: &ThemeConfig,
 ) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -64,5 +74,13 @@ mod tests {
     fn centered_rect_clamps_to_terminal() {
         let rect = centered_rect(Rect::new(2, 3, 10, 6), 40, 20);
         assert_eq!(rect, Rect::new(2, 3, 10, 6));
+    }
+
+    #[test]
+    fn centered_rect_preserves_zero_sized_terminal() {
+        assert_eq!(
+            centered_rect(Rect::new(0, 0, 0, 0), 40, 20),
+            Rect::new(0, 0, 0, 0)
+        );
     }
 }

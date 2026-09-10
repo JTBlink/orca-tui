@@ -152,7 +152,9 @@ cargo clippy --all-targets --all-features
 - Tasks 的 `gh` 请求为同步调用，慢网络会暂时阻塞界面。
 - SSH IPv6、重连次数和 worktree 清理失败路径需要单独覆盖。
 - 普通启动和 `run --all-worktrees` 会优先读取 Orca CLI 的
-  `worktree list --json` 全局 catalog；local checkout 映射到 pane，远程或不可访问的
-  workspace 作为只读 sidebar 条目保留。仅当 Orca CLI 不可用时才回退到当前 Git 仓库的
-  `git worktree list`，不能把 Git 当前仓库的数量当作全局工作台总数。`attach` 会将
-  daemon session 与这份 catalog 并列渲染，daemon 协议不负责提供 workspace inventory。
+  `worktree list --json` 全局 catalog，并针对 Orca 报告的可达 runtime host 继续查询；local
+  checkout 映射到 pane，远程或不可访问的 workspace 作为只读 sidebar 条目保留。对当前 CLI
+  无法覆盖的 host，`w` inventory 会显示 `not covered` 警告，避免把不完整结果伪装成完整目录。
+  仅当 Orca CLI 不可用时才回退到当前 Git 仓库的 `git worktree list`，不能把 Git 当前仓库的
+  数量当作全局工作台总数。`attach` 会将 daemon session 与这份 catalog 并列渲染，daemon
+  协议不负责提供 workspace inventory。
