@@ -4,8 +4,11 @@
 
 这是一个 Rust 项目，包含一个库 crate 和两个二进制程序：
 
-- `src/` 包含应用、TUI 状态机、PTY 与终端模拟、daemon 客户端/服务端、外部集成、worktree
-  管理和配置代码。
+- `src/core/` 放置 Agent、活动记录与任务协调等领域状态；`src/app/` 放置应用状态机、CLI、事件总线
+  和调度逻辑。
+- `src/ui/` 放置 TUI 渲染；`src/terminal/` 放置 PTY、终端模拟和字节流协议。
+- `src/orca/` 放置 Orca daemon 与 workspace catalog 适配；`src/adapters/` 放置系统和外部集成；
+  `src/support/` 放置配置、诊断和性能探针。
 - `src/main.rs` 是 `orca-tui` 入口；`src/bin/inject.rs` 构建 `orca-tui-inject` 排查工具。
 - 单元测试与实现代码放在同一文件中，位于 `src/**/*.rs` 的 `#[cfg(test)]` 模块内。
 - `docs/TECHNICAL-DESIGN.md` 记录架构和协议边界。

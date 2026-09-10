@@ -17,6 +17,15 @@ pub(crate) struct WorkspaceRow {
     pub(crate) detail: String,
 }
 
+/// 绘制 workspace inventory 所需的完整只读状态。
+pub(crate) struct WorkspaceOverlay<'a> {
+    pub(crate) rows: &'a [WorkspaceRow],
+    pub(crate) selected: usize,
+    pub(crate) catalog_loaded: bool,
+    pub(crate) unresolved_hosts: &'a [String],
+    pub(crate) unverifiable_scope_hosts: &'a [String],
+}
+
 /// 在终端中央绘制完整 workspace 清单。
 ///
 /// 清单使用选中项驱动的窗口化：无论条目数量多少，当前选中项都可见，
@@ -25,23 +34,27 @@ pub(crate) struct WorkspaceRow {
 pub(crate) fn render_workspace_overlay(
     frame: &mut Frame<'_>,
     total: Rect,
-    rows: &[WorkspaceRow],
-    selected: usize,
-    unresolved_hosts: &[String],
+    overlay: WorkspaceOverlay<'_>,
     theme: &ThemeConfig,
 ) {
+    let WorkspaceOverlay {
+        rows,
+        selected,
+        catalog_loaded,
+        unresolved_hosts,
+        unverifiable_scope_hosts,
+    } = overlay;
     let pop = crate::overlay::centered_rect(
         total,
         total.width.saturating_sub(4).max(40),
         total.height.saturating_sub(2).max(8),
     );
-    let title = if unresolved_hosts.is_empty() {
+    let title = if unresolved_hosts.is_empty() && unverifiable_scope_hosts.is_empty() {
         format!(" Workspaces ({}) · ↑↓/j k scroll · Esc close ", rows.len())
     } else {
         format!(
-            " Workspaces ({}) · ⚠ {} host(s) unavailable · Esc close ",
-            rows.len(),
-            unresolved_hosts.len()
+            " Workspaces ({}) · ⚠ coverage incomplete · Esc close ",
+            rows.len()
         )
     };
     let inner = crate::overlay::begin_popup(frame, pop, Line::from(title), theme);
@@ -49,21 +62,39 @@ pub(crate) fn render_workspace_overlay(
         return;
     }
 
-    if rows.is_empty() {
-        crate::overlay::render_lines(
-            frame,
-            inner,
-            vec![Line::from("(Orca workspace catalog unavailable)")
-                .style(Style::default().fg(theme.muted()))],
-            theme,
+    let mut warning_lines = Vec::new();
+    if !unresolved_hosts.is_empty() {
+        warning_lines.push(
+            Line::from(format!(" ⚠ not covered: {}", unresolved_hosts.join(", ")))
+                .style(Style::default().fg(theme.error())),
         );
+    }
+    if !unverifiable_scope_hosts.is_empty() {
+        warning_lines.push(
+            Line::from(format!(
+                " ⚠ scope unknown: {}",
+                unverifiable_scope_hosts.join(", ")
+            ))
+            .style(Style::default().fg(theme.error())),
+        );
+    }
+
+    if rows.is_empty() {
+        let mut lines = vec![Line::from(if catalog_loaded {
+            "(no workspaces)"
+        } else {
+            "(Orca workspace catalog unavailable)"
+        })
+        .style(Style::default().fg(theme.muted()))];
+        lines.extend(warning_lines);
+        crate::overlay::render_lines(frame, inner, lines, theme);
         return;
     }
 
     // Reserve one line for the host-scope warning and one for the indicator
     // whenever needed. This keeps completeness state visible without hiding
     // the selected row.
-    let warning_rows = usize::from(!unresolved_hosts.is_empty());
+    let warning_rows = warning_lines.len();
     let has_overflow = rows.len()
         > usize::from(inner.height)
             .saturating_sub(warning_rows)
@@ -113,13 +144,7 @@ pub(crate) fn render_workspace_overlay(
         lines.push(Line::from(indicator).style(Style::default().fg(theme.muted())));
     }
 
-    if !unresolved_hosts.is_empty() {
-        let hosts = unresolved_hosts.join(", ");
-        lines.push(
-            Line::from(format!(" ⚠ not covered: {hosts}"))
-                .style(Style::default().fg(theme.error())),
-        );
-    }
+    lines.extend(warning_lines);
 
     crate::overlay::render_lines(frame, inner, lines, theme);
 }
@@ -154,7 +179,18 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
         terminal
             .draw(|f| {
-                render_workspace_overlay(f, f.area(), &rows, 19, &[], &ThemeConfig::default())
+                render_workspace_overlay(
+                    f,
+                    f.area(),
+                    WorkspaceOverlay {
+                        rows: &rows,
+                        selected: 19,
+                        catalog_loaded: true,
+                        unresolved_hosts: &[],
+                        unverifiable_scope_hosts: &[],
+                    },
+                    &ThemeConfig::default(),
+                )
             })
             .expect("draw");
         let text = buffer_text(terminal.backend().buffer());
@@ -175,15 +211,89 @@ mod tests {
                 render_workspace_overlay(
                     f,
                     f.area(),
-                    &rows,
-                    0,
-                    &["runtime:remote-1".to_owned()],
+                    WorkspaceOverlay {
+                        rows: &rows,
+                        selected: 0,
+                        catalog_loaded: true,
+                        unresolved_hosts: &["runtime:remote-1".to_owned()],
+                        unverifiable_scope_hosts: &[],
+                    },
                     &ThemeConfig::default(),
                 )
             })
             .expect("draw");
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("not covered: runtime:remote-1"));
-        assert!(text.contains("host(s) unavailable"));
+        assert!(text.contains("coverage incomplete"));
+    }
+
+    #[test]
+    fn workspace_overlay_distinguishes_empty_catalog_from_unavailable_catalog() {
+        let mut empty = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        empty
+            .draw(|f| {
+                render_workspace_overlay(
+                    f,
+                    f.area(),
+                    WorkspaceOverlay {
+                        rows: &[],
+                        selected: 0,
+                        catalog_loaded: true,
+                        unresolved_hosts: &[],
+                        unverifiable_scope_hosts: &[],
+                    },
+                    &ThemeConfig::default(),
+                )
+            })
+            .expect("draw empty catalog");
+        let empty_text = buffer_text(empty.backend().buffer());
+        assert!(empty_text.contains("Workspaces (0)"));
+        assert!(empty_text.contains("(no workspaces)"));
+        assert!(!empty_text.contains("catalog unavailable"));
+
+        let mut unavailable = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        unavailable
+            .draw(|f| {
+                render_workspace_overlay(
+                    f,
+                    f.area(),
+                    WorkspaceOverlay {
+                        rows: &[],
+                        selected: 0,
+                        catalog_loaded: false,
+                        unresolved_hosts: &[],
+                        unverifiable_scope_hosts: &[],
+                    },
+                    &ThemeConfig::default(),
+                )
+            })
+            .expect("draw unavailable catalog");
+        let unavailable_text = buffer_text(unavailable.backend().buffer());
+        assert!(unavailable_text.contains("catalog unavailable"));
+    }
+
+    #[test]
+    fn workspace_overlay_discloses_unverifiable_scope() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        terminal
+            .draw(|f| {
+                render_workspace_overlay(
+                    f,
+                    f.area(),
+                    WorkspaceOverlay {
+                        rows: &[],
+                        selected: 0,
+                        catalog_loaded: true,
+                        unresolved_hosts: &[],
+                        unverifiable_scope_hosts: &["runtime:old-server".to_owned()],
+                    },
+                    &ThemeConfig::default(),
+                )
+            })
+            .expect("draw unknown scope");
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("scope unknown: runtime:old-server"));
+        assert!(text.contains("coverage incomplete"));
     }
 }

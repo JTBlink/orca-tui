@@ -20,7 +20,22 @@ Orca daemon：Orca daemon --control/stream sockets-->
 ```
 
 内置 daemon 和 Orca GUI daemon 不是同一个服务，协议不能混用。代码分别位于
-`src/daemon_server.rs` 和 `src/orca_daemon.rs`。
+`src/adapters/daemon_server.rs` 和 `src/orca/daemon.rs`。
+
+## 源码目录
+
+`src/lib.rs` 是稳定的模块 seam：源码按职责放入以下目录，但保留现有
+`orca_tui::app`、`orca_tui::pane` 等公共模块路径，避免目录整理破坏调用方。
+
+| 目录 | 职责 |
+|---|---|
+| `src/core/` | Agent 身份、活动记录、任务协调等领域状态 |
+| `src/app/` | CLI、应用状态机、输入命令、事件总线和帧调度 |
+| `src/ui/` | 布局、Pane、Sidebar、Overlay、Toast 和渲染模型 |
+| `src/terminal/` | PTY 生命周期、终端模拟和 OSC/查询/同步输出协议 |
+| `src/orca/` | Orca daemon 协议与跨 host workspace catalog |
+| `src/adapters/` | 内置 daemon、Git/GitHub、SSH、移动端和剪贴板适配 |
+| `src/support/` | 配置、崩溃日志、脱敏诊断和性能探针 |
 
 ## 模块职责
 
@@ -92,7 +107,7 @@ NDJSON RPC，stream 使用二进制帧：
 带 token、`clientId` 和 role 的 hello；control 与 stream 的 `daemonIdentity` 必须对应同一
 daemon 实例。发现逻辑查找 Orca 的 versioned `daemon-v36.sock` / token，并兼容旧布局。
 
-维护协议适配时，必须同时核对 `src/orca_daemon.rs` 与同级 `../orca/src/main/daemon/` 中的
+维护协议适配时，必须同时核对 `src/orca/daemon.rs` 与同级 `../orca/src/main/daemon/` 中的
 client、stream reader、request router 和测试。不要仅依据旧文档中的字段名或帧格式。
 
 ## CLI 与状态机约束
@@ -152,9 +167,13 @@ cargo clippy --all-targets --all-features
 - Tasks 的 `gh` 请求为同步调用，慢网络会暂时阻塞界面。
 - SSH IPv6、重连次数和 worktree 清理失败路径需要单独覆盖。
 - 普通启动和 `run --all-worktrees` 会优先读取 Orca CLI 的
-  `worktree list --json` 全局 catalog，并针对 Orca 报告的可达 runtime host 继续查询；local
-  checkout 映射到 pane，远程或不可访问的 workspace 作为只读 sidebar 条目保留。对当前 CLI
-  无法覆盖的 host，`w` inventory 会显示 `not covered` 警告，避免把不完整结果伪装成完整目录。
+  `worktree list --json` 全局 catalog，并主动枚举 `environment list --json` 中的所有已配对
+  runtime；这与 Orca 桌面的 all-host catalog 加载边界一致，不依赖本机先在
+  `hostScope.omittedHostIds` 中记录远端。跨 host 合并以“来源 runtime + execution host +
+  workspace ID”去重，保留不同 host 上 ID 相同的 workspace。local checkout 映射到 pane，
+  远程或不可访问的 workspace 作为只读 sidebar 条目保留。对当前 CLI 无法覆盖的 host，`w`
+  inventory 会显示 `not covered`；未返回 `hostScope` 的旧版 host 显示 `scope unknown`，避免把
+  不完整结果伪装成完整目录。
   仅当 Orca CLI 不可用时才回退到当前 Git 仓库的 `git worktree list`，不能把 Git 当前仓库的
   数量当作全局工作台总数。`attach` 会将 daemon session 与这份 catalog 并列渲染，daemon
   协议不负责提供 workspace inventory。

@@ -32,158 +32,166 @@ pub fn run() -> Result<()> {
 #[command(
     name = "orca-tui",
     version = VERSION,
-    about = "Terminal multi-agent coding orchestrator (TUI port of Orca GUI)"
+    about = "终端多智能体编程编排器（Orca GUI 的 TUI 移植版）",
+    subcommand_help_heading = "命令",
+    subcommand_value_name = "命令",
+    next_help_heading = "选项",
+    disable_help_flag = true,
+    disable_version_flag = true,
+    disable_help_subcommand = true,
+    help_template = "{about-section}用法：{usage}\n\n{all-args}{after-help}",
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// 打印帮助信息
+    #[arg(short = 'h', long = "help", action = clap::ArgAction::Help, global = true)]
+    _help: Option<bool>,
+
+    /// 打印版本信息
+    #[arg(short = 'V', long = "version", action = clap::ArgAction::Version)]
+    _version: Option<bool>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run one or more agents in panes.
+    /// 在窗格中运行一个或多个智能体。
     ///
-    /// The trailing command list is split into per-agent commands on the
-    /// literal `::` separator, and each command gets its own pane, e.g.
+    /// 尾部的命令列表以 `::` 分隔符分割为各智能体的命令，每个命令
+    /// 获得自己的窗格，例如：
     ///
-    /// - `orca-tui run -- claude codex opencode` → three side-by-side panes.
-    /// - `orca-tui run -- claude :: codex --model x :: opencode` → three panes;
-    ///   the middle agent's command is `codex --model x`.
+    /// - `orca-tui run -- claude codex opencode` → 三个并排窗格。
+    /// - `orca-tui run -- claude :: codex --model x :: opencode` → 三个窗格；
+    ///   中间智能体的命令为 `codex --model x`。
     ///
-    /// **Splitting rule:** if any `::` is present the list is split into the
-    /// segments between `::` tokens (empty segments from leading/trailing/
-    /// doubled `::` are dropped); if no `::` is present each token is its own
-    /// agent (backward compatible). A stray `::` therefore changes semantics.
+    /// **分割规则：**如果存在 `::` 则按 `::` 分割（开头/结尾/连续
+    /// `::` 产生的空段会被丢弃）；如果不存在 `::` 则每个词各自为一个
+    /// 智能体（向后兼容）。
     Run {
-        /// Working directory shared by every agent. Defaults to the current
-        /// directory.
-        #[arg(long, value_name = "DIR")]
+        /// 所有智能体共享的工作目录。默认为当前目录。
+        #[arg(long, value_name = "目录")]
         cwd: Option<PathBuf>,
 
-        /// Give each agent its own isolated git worktree. Requires `cwd` (or
-        /// the current directory) to be inside a git repository; worktrees are
-        /// created under `.orca-worktrees/` and removed when the app exits.
+        /// 为每个智能体创建独立的 git worktree。要求 `cwd`（或当前目录）
+        /// 位于 git 仓库内；worktree 创建在 `.orca-worktrees/` 下，应用
+        /// 退出时删除。
         #[arg(long)]
         worktree: bool,
 
-        /// Start one pane for every Git worktree registered in the current
-        /// repository. Each pane runs in that worktree's checkout.
+        /// 为当前仓库中注册的每个 Git worktree 启动一个窗格。每个窗格在
+        /// 对应 worktree 的检出目录中运行。
         #[arg(long)]
         all_worktrees: bool,
 
-        /// Try to connect to a running Orca GUI daemon for session
-        /// persistence + multi-client (GUI + TUI). Falls back to standalone
-        /// (direct PTY) if no daemon is found or the connection fails.
+        /// 尝试连接到运行中的 Orca GUI 守护进程以实现会话持久化和多客户端
+        /// （GUI + TUI）。如果未找到守护进程或连接失败，则回退到独立模式
+        /// （直接 PTY）。
         #[arg(long)]
         daemon: bool,
 
-        /// Run each agent on a REMOTE host over SSH (Feature 8). The host spec
-        /// is `user@host`, `host`, or `user@host:port`; each agent command is
-        /// wrapped as `ssh <opts> <host> <command...>`.
-        #[arg(long, value_name = "HOST")]
+        /// 通过 SSH 在远程主机上运行每个智能体（功能 8）。主机格式为
+        /// `user@host`、`host` 或 `user@host:port`；每个智能体命令会被
+        /// 包装为 `ssh <opts> <host> <command...>`。
+        #[arg(long, value_name = "主机")]
         remote: Option<String>,
 
-        /// With `--remote`: auto-reconnect a dropped remote session on the same
-        /// pane after an exponential backoff, up to a few attempts (Feature 8).
+        /// 配合 `--remote` 使用：远程会话断开后，在同一窗格中按指数退避
+        /// 自动重连，最多尝试若干次（功能 8）。
         #[arg(long)]
         reconnect: bool,
 
-        /// Start the mobile-companion WebSocket server (Feature 10) alongside
-        /// the agents, broadcasting live pane status to a phone/PWA. The URL
-        /// and one-time token are printed at startup.
-        #[arg(long, value_name = "PORT")]
+        /// 在运行智能体的同时启动移动端伴侣 WebSocket 服务器（功能 10），
+        /// 向手机/PWA 广播实时窗格状态。启动时会打印 URL 和一次性令牌。
+        #[arg(long, value_name = "端口")]
         mobile: Option<u16>,
 
-        /// One or more agent invocations. Each command (separated by `::`)
-        /// becomes its own pane. Without `::`, each token is its own agent.
-        /// Everything after `--` is captured verbatim, including flags
-        /// intended for the agent itself.
+        /// 一个或多个智能体调用。用 `::` 分隔的每个命令成为一个窗格。
+        /// 不含 `::` 时，每个词为一个智能体。`--` 之后的内容会被原样
+        /// 捕获，包括针对智能体本身的标志。
         #[arg(
             trailing_var_arg = true,
             allow_hyphen_values = true,
             num_args = 1..,
-            value_name = "COMMAND",
+            value_name = "命令",
         )]
         command: Vec<String>,
     },
 
-    /// Plan multi-agent orchestration from a spec (Feature 7).
+    /// 根据规格说明规划多智能体编排（功能 7）。
     ///
-    /// Splits the spec into tasks (one per non-empty line) and dispatches them
-    /// to agents dependency-gated: by default tasks run **sequentially** (each
-    /// depends on the previous), so only one is in flight at a time; pass
-    /// `--parallel` to fan every task out at once. Each task's description is
-    /// passed to the agent as its prompt argument.
+    /// 将规格说明拆分为任务（每个非空行一个任务），按依赖关系调度到
+    /// 智能体：默认**顺序执行**（每个任务依赖前一个），同一时间只有
+    /// 一个任务运行；传入 `--parallel` 可同时并发所有任务。每个任务
+    /// 的描述作为提示参数传递给智能体。
     Orchestrate {
-        /// Newline-separated task spec. Use a quoted multi-line string. Ignored
-        /// when `--issues` is given.
+        /// 以换行分隔的任务规格。使用引号包裹的多行字符串。指定
+        /// `--issues` 时忽略。
         #[arg(long)]
         spec: Option<String>,
-        /// Fan every task out in parallel instead of running them sequentially.
+        /// 并行执行所有任务，而不是顺序执行。
         #[arg(long)]
         parallel: bool,
-        /// Source tasks from a GitHub repo's open issues via `gh`
-        /// (`owner/name`); each issue becomes one task (Feature 9). Overrides
-        /// `--spec`.
-        #[arg(long, value_name = "REPO")]
+        /// 从 GitHub 仓库的开放问题中获取任务（`owner/name`）；每个问题
+        /// 成为一个任务（功能 9，通过 `gh`）。优先于 `--spec`。
+        #[arg(long, value_name = "仓库")]
         issues: Option<String>,
     },
 
-    /// List open pull requests for a GitHub repo via `gh` (Feature 9).
+    /// 通过 `gh` 列出 GitHub 仓库的开放拉取请求（功能 9）。
     Prs {
-        /// `owner/name` GitHub repository.
+        /// `owner/name` 格式的 GitHub 仓库。
         repo: String,
     },
 
-    /// List open issues for a GitHub repo via `gh` (Feature 9).
+    /// 通过 `gh` 列出 GitHub 仓库的开放问题（功能 9）。
     Issues {
-        /// `owner/name` GitHub repository.
+        /// `owner/name` 格式的 GitHub 仓库。
         repo: String,
     },
 
-    /// Start the mobile-companion WebSocket server (Feature 10).
+    /// 启动移动端伴侣 WebSocket 服务器（功能 10）。
     ///
-    /// Binds a local WebSocket server a phone/PWA can connect to. Prints the
-    /// URL and a one-time pairing token. For live snapshots while agents run,
-    /// prefer `run --mobile <PORT>`.
+    /// 绑定一个本地 WebSocket 服务器，手机/PWA 可连接。打印 URL 和
+    /// 一次性配对令牌。如需在智能体运行时获取实时快照，请优先使用
+    /// `run --mobile <端口>`。
     Mobile {
-        /// Port to bind. Defaults to 0 (OS-assigned).
+        /// 绑定端口。默认为 0（由操作系统分配）。
         #[arg(long, default_value_t = 0)]
         port: u16,
     },
 
-    /// Start the built-in daemon server (run as a systemd/supervisor service).
+    /// 启动内置守护进程服务器（作为 systemd/supervisor 服务运行）。
     ///
-    /// Owns agent PTYs and serves `orca-tui attach` clients over a Unix socket.
-    /// Agents survive client disconnect — the daemon keeps running until all
-    /// agents exit and no clients remain, or until SIGTERM.
+    /// 拥有智能体 PTY 并通过 Unix 套接字服务 `orca-tui attach` 客户端。
+    /// 智能体在客户端断开后继续存活——守护进程持续运行直到所有智能体退出
+    /// 且无客户端连接，或收到 SIGTERM。
     ///
-    /// Designed for `systemctl --user start orca-tui` or equivalent. Logs to
-    /// stdout/stderr (captured by journald/supervisor).
+    /// 设计用于 `systemctl --user start orca-tui` 或等效方式。日志输出到
+    /// stdout/stderr（由 journald/supervisor 捕获）。
     Daemon {
-        /// Unix socket path. Defaults to `$XDG_RUNTIME_DIR/orcatui.sock`.
-        #[arg(long, value_name = "PATH")]
+        /// Unix 套接字路径。默认为 `$XDG_RUNTIME_DIR/orcatui.sock`。
+        #[arg(long, value_name = "路径")]
         socket: Option<PathBuf>,
 
-        /// Agent commands (same `::` separator as `run`). If omitted, the
-        /// daemon starts empty and clients create sessions via the protocol.
+        /// 智能体命令（与 `run` 使用相同的 `::` 分隔符）。如果省略，
+        /// 守护进程以空状态启动，客户端通过协议创建会话。
         #[arg(
             trailing_var_arg = true,
             allow_hyphen_values = true,
-            value_name = "COMMAND"
+            value_name = "命令"
         )]
         command: Vec<String>,
     },
 
-    /// Attach to a running orca-tui daemon as a TUI client.
+    /// 作为 TUI 客户端连接到运行中的 orca-tui 守护进程。
     ///
-    /// Connects to the daemon's Unix socket, renders all live agent panes,
-    /// and forwards keyboard input. Multiple clients can attach simultaneously.
-    /// Detaching (Ctrl+Q) does NOT kill the agents — they keep running in the
-    /// daemon.
+    /// 连接到守护进程的 Unix 套接字，渲染所有实时智能体窗格，
+    /// 并转发键盘输入。多个客户端可同时连接。
+    /// 断开连接（Ctrl+Q）不会终止智能体——它们继续在守护进程中运行。
     Attach {
-        /// Unix socket path. Defaults to `$XDG_RUNTIME_DIR/orcatui.sock`.
-        #[arg(long, value_name = "PATH")]
+        /// Unix 套接字路径。默认为 `$XDG_RUNTIME_DIR/orcatui.sock`。
+        #[arg(long, value_name = "路径")]
         socket: Option<PathBuf>,
     },
 }
@@ -254,13 +262,17 @@ fn dispatch_command(command: Command) -> Result<()> {
                 (prepare_run_specs(command, remote.as_deref())?, catalog)
             };
 
-            let mut app = App::spawn_agents_with_catalog(
-                specs,
-                cwd.as_deref(),
-                worktree,
-                workspace_catalog.workspaces,
-            )?;
-            app.set_workspace_catalog_scope(workspace_catalog.unresolved_host_ids);
+            let loaded_from_orca = workspace_catalog.loaded_from_orca;
+            let unresolved_host_ids = workspace_catalog.unresolved_host_ids;
+            let unverifiable_scope_host_ids = workspace_catalog.unverifiable_scope_host_ids;
+            let catalog_rows = workspace_catalog.workspaces;
+            let mut app =
+                App::spawn_agents_with_catalog(specs, cwd.as_deref(), worktree, catalog_rows)?;
+            app.set_workspace_catalog_status(
+                loaded_from_orca,
+                unresolved_host_ids,
+                unverifiable_scope_host_ids,
+            );
 
             // Try to connect to an Orca GUI daemon (--daemon). Falls back to
             // standalone silently if no daemon is found; shows a toast if a
@@ -567,6 +579,7 @@ fn prepare_all_worktree_specs_with_catalog(
             repo_id: String::new(),
             project_id: None,
             host_id: Some("local".to_owned()),
+            catalog_source_host_id: None,
             is_archived: false,
             workspace_status: None,
             is_main_worktree: false,
@@ -581,6 +594,8 @@ fn prepare_all_worktree_specs_with_catalog(
         OrcaWorkspaceCatalog {
             workspaces,
             unresolved_host_ids: Vec::new(),
+            unverifiable_scope_host_ids: Vec::new(),
+            loaded_from_orca: false,
         },
     ))
 }
@@ -643,8 +658,18 @@ fn run_attach(socket_path: &Path) -> Result<()> {
     // global workspace catalog separately so an attach client still shows
     // every workspace across repositories and execution hosts, including
     // remote/archived rows that do not have a local PTY in this daemon.
-    let (workspace_catalog, unresolved_host_ids) = match orca_workspaces::list_all_with_scope() {
-        Ok(catalog) => (catalog.workspaces, catalog.unresolved_host_ids),
+    let (
+        workspace_catalog,
+        workspace_catalog_loaded,
+        unresolved_host_ids,
+        unverifiable_scope_host_ids,
+    ) = match orca_workspaces::list_all_with_scope() {
+        Ok(catalog) => (
+            catalog.workspaces,
+            catalog.loaded_from_orca,
+            catalog.unresolved_host_ids,
+            catalog.unverifiable_scope_host_ids,
+        ),
         Err(err) => {
             if crate::debug_log::enabled() {
                 crate::debug_log::append(format_args!(
@@ -653,7 +678,7 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                     crate::debug_log::classify_error(err.as_ref())
                 ));
             }
-            (Vec::new(), Vec::new())
+            (Vec::new(), false, Vec::new(), Vec::new())
         }
     };
     let workspace_rows: Vec<WorkspaceRow> = workspace_catalog
@@ -821,9 +846,13 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                     workspace_view::render_workspace_overlay(
                         f,
                         total,
-                        &workspace_rows,
-                        workspace_selected,
-                        &unresolved_host_ids,
+                        workspace_view::WorkspaceOverlay {
+                            rows: &workspace_rows,
+                            selected: workspace_selected,
+                            catalog_loaded: workspace_catalog_loaded,
+                            unresolved_hosts: &unresolved_host_ids,
+                            unverifiable_scope_hosts: &unverifiable_scope_host_ids,
+                        },
                         theme,
                     );
                 }

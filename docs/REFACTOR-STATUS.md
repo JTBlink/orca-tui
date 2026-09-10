@@ -2,6 +2,9 @@
 
 本文记录本轮 App 结构重构的边界、验证命令和已知环境差异，便于后续维护者继续拆分。
 
+源码已按职责归入 `core`、`app`、`ui`、`terminal`、`orca`、`adapters` 和 `support` 七个目录。
+`src/lib.rs` 通过显式路径维持原有公共模块名，因此本次物理目录整理不会改变库调用方的接口。
+
 ## 已落地的 seam
 
 - `PaneSlot` 是唯一的 per-pane 状态集合，包含 PTY、启动命令、task、daemon session、重连、pin

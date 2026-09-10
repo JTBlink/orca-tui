@@ -192,10 +192,15 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// Local rows are represented by their running pane and are filtered out
     /// at render time to avoid duplicate sidebar entries.
     workspace_catalog: Vec<OrcaWorkspace>,
+    workspace_catalog_loaded: bool,
     /// Runtime hosts that Orca reported but this CLI could not query. Keeping
     /// them separate lets the inventory explain why a remote catalog may be
     /// incomplete instead of silently presenting a partial list as complete.
     workspace_unresolved_hosts: Vec<String>,
+    /// Catalog sources that returned rows but did not report host scope. Their
+    /// workspace rows are shown, while the overlay discloses that completeness
+    /// cannot be proven for that source.
+    workspace_unverifiable_scope_hosts: Vec<String>,
     /// Feature 5: adaptive frame scheduler — throttles rendering to a 60fps
     /// budget, skips frames when behind (backpressure), and backs off the poll
     /// interval when idle (no input/agent output) to save CPU.
@@ -480,6 +485,7 @@ impl App {
             }
         }
 
+        let workspace_catalog_loaded = !workspace_catalog.is_empty();
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::new(backend).context("building ratatui terminal")?;
 
@@ -492,7 +498,9 @@ impl App {
             raw_mode_active: false,
             worktrees: owned,
             workspace_catalog,
+            workspace_catalog_loaded,
             workspace_unresolved_hosts: Vec::new(),
+            workspace_unverifiable_scope_hosts: Vec::new(),
             scheduler: FrameScheduler::new(TARGET_FRAME_60FPS, Instant::now()),
             snapshot_tx: None,
             coordinator: None,
@@ -550,24 +558,32 @@ impl<B: Backend> App<B> {
     /// may load it before entering the terminal loop so the first rendered
     /// frame already contains every Orca workspace.
     pub fn set_workspace_catalog(&mut self, catalog: Vec<OrcaWorkspace>) {
+        self.workspace_catalog_loaded = !catalog.is_empty();
         self.workspace_catalog = catalog;
     }
 
-    /// Record host-scope gaps reported by Orca's workspace listing. The rows
-    /// already loaded remain visible; the `w` inventory adds an explicit
-    /// warning for each unresolved host.
-    pub fn set_workspace_catalog_scope(&mut self, unresolved_hosts: Vec<String>) {
+    /// Preserve whether an empty result was authoritative and attach any
+    /// completeness warnings discovered while loading the catalog.
+    pub fn set_workspace_catalog_status(
+        &mut self,
+        loaded_from_orca: bool,
+        unresolved_hosts: Vec<String>,
+        unverifiable_scope_hosts: Vec<String>,
+    ) {
+        self.workspace_catalog_loaded = loaded_from_orca;
         self.workspace_unresolved_hosts = unresolved_hosts;
+        self.workspace_unverifiable_scope_hosts = unverifiable_scope_hosts;
     }
 
     fn catalog_sidebar_entries(&self) -> Vec<crate::sidebar::SidebarEntry> {
         self.workspace_catalog
             .iter()
             .filter(|workspace| {
-                !self
-                    .panes
-                    .iter()
-                    .any(|pane| pane.workspace_id.as_deref() == Some(workspace.id.as_str()))
+                !workspace.is_on_local_host()
+                    || !self
+                        .panes
+                        .iter()
+                        .any(|pane| pane.workspace_id.as_deref() == Some(workspace.id.as_str()))
             })
             .map(|workspace| crate::sidebar::SidebarEntry {
                 name: workspace.sidebar_name(),
@@ -584,7 +600,7 @@ impl<B: Backend> App<B> {
     /// the Orca catalog is unavailable, keep the overlay useful by exposing
     /// the panes currently owned by this TUI as a local fallback inventory.
     fn workspace_inventory_rows(&self) -> Vec<WorkspaceRow> {
-        if !self.workspace_catalog.is_empty() {
+        if self.workspace_catalog_loaded {
             return self
                 .workspace_catalog
                 .iter()
@@ -607,7 +623,7 @@ impl<B: Backend> App<B> {
     }
 
     fn workspace_count(&self) -> usize {
-        if self.workspace_catalog.is_empty() {
+        if !self.workspace_catalog_loaded {
             self.panes.len()
         } else {
             self.workspace_catalog.len()
@@ -1923,6 +1939,7 @@ impl<B: Backend> App<B> {
         };
         let workspace_selected = self.workspace_selected;
         let workspace_unresolved_hosts = self.workspace_unresolved_hosts.clone();
+        let workspace_unverifiable_scope_hosts = self.workspace_unverifiable_scope_hosts.clone();
         // Snapshot the Tasks view state (Phase 2) BEFORE the mutable `panes`
         // borrow so the draw closure never touches the tasks_* fields.
         let tasks_repo_open = mode == InputMode::TasksRepo;
@@ -2016,7 +2033,9 @@ impl<B: Backend> App<B> {
             dashboard_entries: dashboard_entries.clone(),
             workspace_rows,
             workspace_selected,
+            workspace_catalog_loaded: self.workspace_catalog_loaded,
             workspace_unresolved_hosts,
+            workspace_unverifiable_scope_hosts,
         };
         let panes = &mut self.panes;
         let theme = &self.config.theme;
@@ -2342,9 +2361,15 @@ impl<B: Backend> App<B> {
                 crate::workspace_view::render_workspace_overlay(
                     f,
                     total,
-                    &render_model.overlay.workspace_rows,
-                    render_model.overlay.workspace_selected,
-                    &render_model.overlay.workspace_unresolved_hosts,
+                    crate::workspace_view::WorkspaceOverlay {
+                        rows: &render_model.overlay.workspace_rows,
+                        selected: render_model.overlay.workspace_selected,
+                        catalog_loaded: render_model.overlay.workspace_catalog_loaded,
+                        unresolved_hosts: &render_model.overlay.workspace_unresolved_hosts,
+                        unverifiable_scope_hosts: &render_model
+                            .overlay
+                            .workspace_unverifiable_scope_hosts,
+                    },
                     theme,
                 );
             }
@@ -3661,7 +3686,9 @@ mod tests {
                 raw_mode_active: false,
                 worktrees: None,
                 workspace_catalog: Vec::new(),
+                workspace_catalog_loaded: false,
                 workspace_unresolved_hosts: Vec::new(),
+                workspace_unverifiable_scope_hosts: Vec::new(),
                 scheduler: FrameScheduler::new(TARGET_FRAME_60FPS, Instant::now()),
                 snapshot_tx: None,
                 coordinator: None,
@@ -4494,6 +4521,7 @@ mod tests {
                 repo_id: "repo-a".to_owned(),
                 project_id: Some("github:org/repo-a".to_owned()),
                 host_id: Some("local".to_owned()),
+                catalog_source_host_id: None,
                 is_archived: false,
                 workspace_status: None,
                 is_main_worktree: true,
@@ -4506,6 +4534,7 @@ mod tests {
                 repo_id: "repo-b".to_owned(),
                 project_id: Some("github:org/repo-b".to_owned()),
                 host_id: Some("ssh-host".to_owned()),
+                catalog_source_host_id: None,
                 is_archived: false,
                 workspace_status: None,
                 is_main_worktree: false,
@@ -4518,22 +4547,64 @@ mod tests {
     }
 
     #[test]
-    fn workspace_inventory_overlay_renders_and_scrolls_complete_catalog() {
-        let mut app = App::for_test(Vec::new());
-        app.workspace_catalog = (0..20)
-            .map(|index| OrcaWorkspace {
-                id: format!("repo::{index}"),
-                path: PathBuf::from(format!("/workspace/{index}")),
-                branch: format!("feature-{index}"),
-                display_name: format!("workspace-{index}"),
-                repo_id: "repo".to_owned(),
+    fn catalog_sidebar_keeps_remote_copy_with_same_workspace_id() {
+        let mut app = App::for_test(vec![pane(0, "repo/main")]);
+        app.panes[0].workspace_id = Some("repo-a::/same/main".to_owned());
+        app.workspace_catalog = vec![
+            OrcaWorkspace {
+                id: "repo-a::/same/main".to_owned(),
+                path: PathBuf::from("/same/main"),
+                branch: "main".to_owned(),
+                display_name: "main".to_owned(),
+                repo_id: "repo-a".to_owned(),
                 project_id: None,
                 host_id: Some("local".to_owned()),
+                catalog_source_host_id: None,
                 is_archived: false,
                 workspace_status: None,
-                is_main_worktree: false,
-            })
-            .collect();
+                is_main_worktree: true,
+            },
+            OrcaWorkspace {
+                id: "repo-a::/same/main".to_owned(),
+                path: PathBuf::from("/same/main"),
+                branch: "main".to_owned(),
+                display_name: "main".to_owned(),
+                repo_id: "repo-a".to_owned(),
+                project_id: None,
+                host_id: Some("runtime:env-1".to_owned()),
+                catalog_source_host_id: Some("runtime:env-1".to_owned()),
+                is_archived: false,
+                workspace_status: None,
+                is_main_worktree: true,
+            },
+        ];
+
+        let rows = app.catalog_sidebar_entries();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].branch.as_deref(), Some("main @ runtime:env-1"));
+    }
+
+    #[test]
+    fn workspace_inventory_overlay_renders_and_scrolls_complete_catalog() {
+        let mut app = App::for_test(Vec::new());
+        app.set_workspace_catalog(
+            (0..20)
+                .map(|index| OrcaWorkspace {
+                    id: format!("repo::{index}"),
+                    path: PathBuf::from(format!("/workspace/{index}")),
+                    branch: format!("feature-{index}"),
+                    display_name: format!("workspace-{index}"),
+                    repo_id: "repo".to_owned(),
+                    project_id: None,
+                    host_id: Some("local".to_owned()),
+                    catalog_source_host_id: None,
+                    is_archived: false,
+                    workspace_status: None,
+                    is_main_worktree: false,
+                })
+                .collect(),
+        );
         app.mode = InputMode::Workspaces;
         app.workspace_selected = 19;
         app.render().expect("render workspace inventory");

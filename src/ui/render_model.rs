@@ -45,7 +45,9 @@ pub(crate) struct OverlayModel {
     pub(crate) dashboard_entries: Vec<(String, AgentStatus)>,
     pub(crate) workspace_rows: Vec<WorkspaceRow>,
     pub(crate) workspace_selected: usize,
+    pub(crate) workspace_catalog_loaded: bool,
     pub(crate) workspace_unresolved_hosts: Vec<String>,
+    pub(crate) workspace_unverifiable_scope_hosts: Vec<String>,
 }
 
 impl RenderModel {
