@@ -341,7 +341,9 @@ pub fn status_tally(statuses: &[AgentStatus]) -> StatusTally {
 /// Launch specification for one agent.
 ///
 /// `command[0]` is the binary (classified into [`AgentKind`]); the rest are its
-/// args. `worktree` is the optional per-agent git worktree (Orca GUI model).
+/// args. `worktree` is the optional per-agent git worktree (Orca GUI model),
+/// and `worktree_branch` is its display label when the workspace came from an
+/// existing Git worktree.
 #[derive(Debug, Clone)]
 pub struct AgentSpec {
     /// Classified agent kind.
@@ -353,6 +355,8 @@ pub struct AgentSpec {
     pub command: Vec<String>,
     /// Optional per-agent git worktree directory.
     pub worktree: Option<PathBuf>,
+    /// Branch or workspace label associated with `worktree`.
+    pub worktree_branch: Option<String>,
 }
 
 impl AgentSpec {
@@ -382,6 +386,7 @@ impl AgentSpec {
             name,
             command,
             worktree: None,
+            worktree_branch: None,
         }
     }
 }

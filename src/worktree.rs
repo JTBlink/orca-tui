@@ -116,13 +116,9 @@ impl WorktreeManager {
         &self.repo_root
     }
 
-    /// Count worktrees currently registered by Git.
-    ///
-    /// This is a diagnostic primitive rather than an application inventory:
-    /// the TUI still models running panes separately from Git/Orca worktrees.
-    /// Only the count is exposed to callers so diagnostics do not need to
-    /// persist checkout paths.
-    pub(crate) fn registered_count(&self) -> Result<usize> {
+    /// List every worktree currently registered by Git, including the main
+    /// checkout. This is the local equivalent of Orca's workspace inventory.
+    pub fn list_registered(&self) -> Result<Vec<Worktree>> {
         let out = self
             .git()
             .args(["worktree", "list", "--porcelain"])
@@ -134,10 +130,43 @@ impl WorktreeManager {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|line| line.strip_prefix("worktree ").is_some())
-            .count())
+
+        let mut worktrees = Vec::new();
+        let mut current: Option<Worktree> = None;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                if let Some(worktree) = current.take() {
+                    worktrees.push(worktree);
+                }
+                let path = PathBuf::from(path);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    self.repo_root.join(path)
+                };
+                current = Some(Worktree {
+                    path,
+                    branch: "detached".to_owned(),
+                });
+            } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+                if let Some(worktree) = current.as_mut() {
+                    worktree.branch = branch.to_owned();
+                }
+            } else if line == "detached" {
+                if let Some(worktree) = current.as_mut() {
+                    worktree.branch = "detached".to_owned();
+                }
+            }
+        }
+        if let Some(worktree) = current {
+            worktrees.push(worktree);
+        }
+        Ok(worktrees)
+    }
+
+    /// Count worktrees currently registered by Git.
+    pub(crate) fn registered_count(&self) -> Result<usize> {
+        Ok(self.list_registered()?.len())
     }
 
     /// Create a fresh worktree + branch for `agent_name`.
@@ -593,6 +622,27 @@ mod tests {
 
         // Registered in `git worktree list`.
         assert!(repo.worktree_listed(&wt.path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_registered_includes_main_and_created_worktrees() {
+        let repo = TempRepo::new().expect("temp git repo");
+        let mgr = WorktreeManager::open(&repo.path).expect("open");
+        let created = mgr.create_for("codex").expect("create").clone();
+
+        let listed = mgr.list_registered().expect("list");
+        assert_eq!(listed.len(), 2, "main checkout plus created worktree");
+        let repo_path = repo.path.canonicalize().expect("canonical repo path");
+        assert!(listed
+            .iter()
+            .any(|wt| wt.path.canonicalize().ok().as_ref() == Some(&repo_path)));
+        let created_path = created.path.canonicalize().expect("canonical created path");
+        let found = listed
+            .iter()
+            .find(|wt| wt.path.canonicalize().ok().as_ref() == Some(&created_path))
+            .expect("created worktree listed");
+        assert_eq!(found.branch, created.branch);
     }
 
     #[cfg(unix)]

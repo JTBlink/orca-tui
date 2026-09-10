@@ -14,6 +14,7 @@ use crate::agent::{AgentKind, AgentSpec};
 use crate::app::App;
 use crate::integrations::{self, RepoRef};
 use crate::ssh::SshTarget;
+use crate::worktree::WorktreeManager;
 use crate::{coordinator, mobile};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -63,6 +64,11 @@ enum Command {
         /// created under `.orca-worktrees/` and removed when the app exits.
         #[arg(long)]
         worktree: bool,
+
+        /// Start one pane for every Git worktree registered in the current
+        /// repository. Each pane runs in that worktree's checkout.
+        #[arg(long)]
+        all_worktrees: bool,
 
         /// Try to connect to a running Orca GUI daemon for session
         /// persistence + multi-client (GUI + TUI). Falls back to standalone
@@ -200,6 +206,7 @@ fn default_command() -> Command {
         Command::Run {
             cwd: None,
             worktree: false,
+            all_worktrees: true,
             daemon: false,
             remote: None,
             reconnect: false,
@@ -215,6 +222,7 @@ fn dispatch_command(command: Command) -> Result<()> {
         Command::Run {
             cwd,
             worktree,
+            all_worktrees,
             daemon,
             remote,
             reconnect,
@@ -224,13 +232,22 @@ fn dispatch_command(command: Command) -> Result<()> {
             // In worktree-isolation mode `cwd` must resolve to a git repo; if
             // the caller didn't pass --cwd, default to the current directory so
             // the repo can be discovered.
-            let cwd = if worktree && cwd.is_none() {
+            let cwd = if (worktree || all_worktrees) && cwd.is_none() {
                 Some(std::env::current_dir()?)
             } else {
                 cwd
             };
 
-            let specs = prepare_run_specs(command, remote.as_deref())?;
+            let specs = if all_worktrees {
+                if daemon || worktree || reconnect {
+                    anyhow::bail!(
+                        "--all-worktrees cannot be combined with --daemon, --worktree, or --reconnect"
+                    );
+                }
+                prepare_all_worktree_specs(command, cwd.as_deref(), remote.as_deref())?
+            } else {
+                prepare_run_specs(command, remote.as_deref())?
+            };
 
             let mut app = App::spawn_agents(specs, cwd.as_deref(), worktree)?;
 
@@ -437,6 +454,77 @@ fn prepare_run_specs(command: Vec<String>, remote: Option<&str>) -> Result<Vec<A
         }
     }
     Ok(specs)
+}
+
+/// Build one launch spec for each worktree registered in the current repo.
+/// The worktree path is retained on the spec so App can use it as the PTY cwd;
+/// unlike `--worktree`, these checkouts are existing Orca/Git workspaces and
+/// are not removed when the TUI exits.
+fn prepare_all_worktree_specs(
+    command: Vec<String>,
+    cwd: Option<&Path>,
+    remote: Option<&str>,
+) -> Result<Vec<AgentSpec>> {
+    if remote.is_some() {
+        anyhow::bail!("--all-worktrees cannot be combined with --remote");
+    }
+    let command = if command.is_empty() {
+        vec![AgentKind::detect_installed()
+            .first()
+            .map(AgentKind::binary)
+            .unwrap_or("bash")
+            .to_owned()]
+    } else {
+        command
+    };
+    // In this mode the command is replicated across worktrees, so preserve
+    // ordinary agent arguments (`codex --model ...`) as one invocation. `::`
+    // remains accepted for consistency with the regular run parser.
+    let commands = if command.iter().any(|arg| arg == "::") {
+        split_agents(command)
+    } else {
+        vec![command]
+    };
+    if commands.is_empty() {
+        anyhow::bail!("no agent command given — usage: orca-tui run -- <command>...");
+    }
+    if commands.len() != 1 {
+        anyhow::bail!("--all-worktrees accepts one agent command");
+    }
+    let command = commands.into_iter().next().expect("validated one command");
+
+    let base = cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let manager = match WorktreeManager::open(&base) {
+        Ok(manager) => manager,
+        Err(_) => return Ok(vec![AgentSpec::from_command(command)]),
+    };
+    let worktrees = manager.list_registered()?;
+    if worktrees.is_empty() {
+        return Ok(vec![AgentSpec::from_command(command)]);
+    }
+
+    Ok(worktrees
+        .into_iter()
+        .map(|worktree| {
+            let mut spec = AgentSpec::from_command(command.clone());
+            let name = if worktree.branch == "detached" {
+                worktree
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("detached")
+                    .to_owned()
+            } else {
+                worktree.branch.clone()
+            };
+            spec.name = name;
+            spec.worktree_branch = Some(worktree.branch);
+            spec.worktree = Some(worktree.path);
+            spec
+        })
+        .collect())
 }
 
 /// Install a SIGTERM handler that sets the atomic shutdown flag.
@@ -769,6 +857,34 @@ mod tests {
         assert!(specs[0].command.iter().any(|arg| arg == "example.com"));
     }
 
+    #[test]
+    fn all_worktree_specs_follow_git_inventory() {
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let manager = WorktreeManager::open(&cwd).expect("the test crate is in a git repo");
+        let expected = manager.list_registered().expect("list worktrees");
+        let specs = prepare_all_worktree_specs(vec!["echo".into()], Some(&cwd), None)
+            .expect("build one spec per worktree");
+        assert_eq!(specs.len(), expected.len());
+        assert!(specs.iter().all(|spec| {
+            spec.worktree.is_some() && spec.worktree_branch.is_some() && spec.name != "echo"
+        }));
+    }
+
+    #[test]
+    fn all_worktree_specs_keep_agent_arguments_together() {
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let specs = prepare_all_worktree_specs(
+            vec!["echo".into(), "workspace argument".into()],
+            Some(&cwd),
+            None,
+        )
+        .expect("build specs");
+        assert!(!specs.is_empty());
+        assert!(specs
+            .iter()
+            .all(|spec| spec.command == ["echo", "workspace argument"]));
+    }
+
     /// End-to-end check of the spec-building path: splitting + the empty guard.
     #[test]
     fn smoke_parse_three_agents_via_separator() {
@@ -801,6 +917,7 @@ mod tests {
             "--cwd",
             "/tmp",
             "--worktree",
+            "--all-worktrees",
             "--daemon",
             "--remote",
             "user@host",
@@ -815,6 +932,7 @@ mod tests {
             Command::Run {
                 cwd,
                 worktree,
+                all_worktrees,
                 daemon,
                 remote,
                 reconnect,
@@ -823,6 +941,7 @@ mod tests {
             } => {
                 assert_eq!(cwd.as_deref(), Some(std::path::Path::new("/tmp")));
                 assert!(worktree, "--worktree parsed");
+                assert!(all_worktrees, "--all-worktrees parsed");
                 assert!(daemon, "--daemon parsed");
                 assert!(reconnect, "--reconnect parsed");
                 assert_eq!(remote.as_deref(), Some("user@host"));
@@ -841,6 +960,7 @@ mod tests {
             Command::Run {
                 cwd,
                 worktree,
+                all_worktrees,
                 daemon,
                 remote,
                 reconnect,
@@ -849,6 +969,7 @@ mod tests {
             } => {
                 assert!(cwd.is_none());
                 assert!(!worktree);
+                assert!(!all_worktrees);
                 assert!(!daemon);
                 assert!(remote.is_none());
                 assert!(!reconnect);

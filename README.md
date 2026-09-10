@@ -47,6 +47,18 @@ orca-tui
 ./orca-tui.sh
 ```
 
+在 Git 仓库内直接启动时，TUI 会自动枚举当前仓库已注册的全部 worktree，
+并为每个 worktree 建立一个 pane；Agent 会在对应 checkout 中运行。也可以显式使用
+`--all-worktrees`：
+
+```bash
+orca-tui run --all-worktrees -- codex
+```
+
+该模式使用已有工作区，不会在退出时删除它们。`--worktree` 仍表示为本次运行创建临时
+隔离 worktree，两者不能同时使用。仓库外启动或无法读取 Git worktree 时，会回退为普通
+单 pane 模式。
+
 运行 Agent：
 
 ```bash
@@ -148,7 +160,7 @@ Tasks 视图需要输入 `owner/name` 格式的 GitHub 仓库。选择 issue 或
 ## CLI 参考
 
 ```text
-orca-tui run [--cwd DIR] [--worktree] [--daemon] [--remote HOST] [--reconnect] [--mobile PORT] -- COMMAND...
+orca-tui run [--cwd DIR] [--worktree] [--all-worktrees] [--daemon] [--remote HOST] [--reconnect] [--mobile PORT] -- COMMAND...
 orca-tui daemon [--socket PATH] [-- COMMAND...]
 orca-tui attach [--socket PATH]
 orca-tui orchestrate [--spec TEXT | --issues OWNER/NAME] [--parallel]

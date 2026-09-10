@@ -351,7 +351,7 @@ impl App {
         // receive the stable `id` instead.
         let mut next_id = 0usize;
 
-        for (idx, spec) in specs.into_iter().enumerate() {
+        for spec in specs.into_iter() {
             let id = next_id;
             next_id += 1;
             let name = spec.name.clone();
@@ -366,10 +366,8 @@ impl App {
                         .with_context(|| format!("creating worktree for {name:?}"))?;
                     (Some(wt.path.clone()), Some(wt.branch.clone()))
                 } else {
-                    (
-                        Some(launch_cwd.clone()),
-                        spec.worktree.as_ref().map(|p| p.display().to_string()),
-                    )
+                    let (cwd, label) = spec_launch_target(&spec, &launch_cwd);
+                    (Some(cwd), label)
                 };
             match PtySession::spawn(command.clone(), agent_cwd.as_deref(), cols, rows) {
                 Ok((session, rx)) => {
@@ -436,13 +434,13 @@ impl App {
                     .and_then(|manager| manager.registered_count())
                 {
                     Ok(registered_count) => crate::debug_log::append(format_args!(
-                        "{} startup isolate=false panes={} owned_created=0 git_registered={} sidebar_source=running_panes",
+                        "{} startup isolate=false panes={} owned_created=0 git_registered={} sidebar_source=git_worktrees_or_running_panes",
                         crate::debug_log::WORKTREE_PREFIX,
                         panes.len(),
                         registered_count
                     )),
                     Err(err) => crate::debug_log::append(format_args!(
-                        "{} startup isolate=false panes={} owned_created=0 git_probe=error:{} sidebar_source=running_panes",
+                        "{} startup isolate=false panes={} owned_created=0 git_probe=error:{} sidebar_source=git_worktrees_or_running_panes",
                         crate::debug_log::WORKTREE_PREFIX,
                         panes.len(),
                         crate::debug_log::classify_error(err.as_ref())
@@ -493,6 +491,22 @@ impl App {
             tasks_request_id: 0,
         })
     }
+}
+
+/// Resolve the checkout and sidebar label for a launch spec. Existing
+/// worktrees are persistent, so their path is used directly; specs without a
+/// worktree retain the app's launch directory.
+fn spec_launch_target(spec: &AgentSpec, launch_cwd: &Path) -> (PathBuf, Option<String>) {
+    let cwd = spec
+        .worktree
+        .clone()
+        .unwrap_or_else(|| launch_cwd.to_path_buf());
+    let label = spec.worktree_branch.clone().or_else(|| {
+        spec.worktree
+            .as_ref()
+            .map(|path| path.display().to_string())
+    });
+    (cwd, label)
 }
 
 // Everything below is generic over the backend so a `TestBackend` can be
@@ -1156,10 +1170,14 @@ impl<B: Backend> App<B> {
         let command = spec.command.clone();
         let cols = self.cols;
         let rows = self.rows;
-        match PtySession::spawn(spec.command, Some(&self.launch_cwd), cols, rows) {
+        let (agent_cwd, branch_label) = spec_launch_target(&spec, &self.launch_cwd);
+        match PtySession::spawn(spec.command, Some(&agent_cwd), cols, rows) {
             Ok((session, rx)) => {
                 let mut pane = Pane::new(id, &name, cols, rows);
                 pane.set_state(AgentState::Running);
+                if let Some(branch) = branch_label {
+                    pane.set_branch(Some(branch));
+                }
                 self.panes.push(PaneSlot::new(pane, command.clone()));
                 let tx = self.bus_tx.clone();
                 let _ = thread::Builder::new()
@@ -4264,6 +4282,20 @@ mod tests {
         // Focusing the new pane + rendering the whole grid must not panic.
         app.focus = idx;
         app.render().expect("render after a failed spawn_one");
+    }
+
+    #[test]
+    fn spec_launch_target_prefers_existing_worktree() {
+        let spec = AgentSpec {
+            kind: AgentKind::Generic,
+            name: "feature".to_owned(),
+            command: vec!["bash".to_owned()],
+            worktree: Some(PathBuf::from("/tmp/feature-worktree")),
+            worktree_branch: Some("feature/login".to_owned()),
+        };
+        let (cwd, label) = spec_launch_target(&spec, Path::new("/tmp/repo"));
+        assert_eq!(cwd, PathBuf::from("/tmp/feature-worktree"));
+        assert_eq!(label.as_deref(), Some("feature/login"));
     }
 
     #[test]
