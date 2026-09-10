@@ -138,18 +138,6 @@ enum Command {
         issues: Option<String>,
     },
 
-    /// 通过 `gh` 列出 GitHub 仓库的开放拉取请求（功能 9）。
-    Prs {
-        /// `owner/name` 格式的 GitHub 仓库。
-        repo: String,
-    },
-
-    /// 通过 `gh` 列出 GitHub 仓库的开放问题（功能 9）。
-    Issues {
-        /// `owner/name` 格式的 GitHub 仓库。
-        repo: String,
-    },
-
     /// 启动移动端伴侣 WebSocket 服务器（功能 10）。
     ///
     /// 绑定一个本地 WebSocket 服务器，手机/PWA 可连接。打印 URL 和
@@ -377,33 +365,6 @@ fn dispatch_command(command: Command) -> Result<()> {
             let mut app = App::spawn_agents(Vec::new(), None, false)?;
             app.set_orchestration(coord, agent_bin);
             app.run()?;
-            Ok(())
-        }
-
-        Command::Prs { repo } => {
-            let repo = RepoRef::parse(&repo)?;
-            let prs = integrations::list_pull_requests(&repo)?;
-            if prs.is_empty() {
-                println!("orca-tui: no open pull requests for {repo}");
-            }
-            for pr in prs {
-                match &pr.branch {
-                    Some(b) => println!("#{}  {}  ({})", pr.number, pr.title, b),
-                    None => println!("#{}  {}", pr.number, pr.title),
-                }
-            }
-            Ok(())
-        }
-
-        Command::Issues { repo } => {
-            let repo = RepoRef::parse(&repo)?;
-            let issues = integrations::list_issues(&repo)?;
-            if issues.is_empty() {
-                println!("orca-tui: no open issues for {repo}");
-            }
-            for iss in issues {
-                println!("#{}  {}", iss.number, iss.title);
-            }
             Ok(())
         }
 
