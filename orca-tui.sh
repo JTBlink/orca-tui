@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # Convenient launcher for a source checkout.
-# Prefer an existing optimized build, then a debug build, and finally Cargo.
+# Let Cargo validate source freshness; it reuses an up-to-date build and
+# rebuilds automatically after source changes.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if command -v cargo >/dev/null 2>&1; then
+  exec cargo run --locked \
+    --manifest-path "$SCRIPT_DIR/Cargo.toml" \
+    --bin orca-tui -- "$@"
+fi
 
 if [[ -x "$SCRIPT_DIR/target/release/orca-tui" ]]; then
   exec "$SCRIPT_DIR/target/release/orca-tui" "$@"
@@ -14,9 +21,5 @@ if [[ -x "$SCRIPT_DIR/target/debug/orca-tui" ]]; then
   exec "$SCRIPT_DIR/target/debug/orca-tui" "$@"
 fi
 
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "orca-tui: 未找到已构建的二进制，且 cargo 不在 PATH 中" >&2
-  exit 127
-fi
-
-exec cargo run --manifest-path "$SCRIPT_DIR/Cargo.toml" --bin orca-tui -- "$@"
+echo "orca-tui: 未找到 Cargo 或可用的已构建二进制" >&2
+exit 127

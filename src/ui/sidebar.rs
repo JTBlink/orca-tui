@@ -26,6 +26,11 @@ use crate::osc::AgentActivity;
 /// one-line and pass unmodified.
 const TWO_LINE_MIN_WIDTH: u16 = 36;
 
+/// Smallest useful sidebar width when the configured width does not fit.
+/// The one-line renderer is already designed for 16-column sidebars; below
+/// this point keeping the pane usable is more helpful than drawing a sliver.
+const MIN_COMPACT_WIDTH: u16 = 16;
+
 /// One row of sidebar display data (no [`crate::pane::Pane`] dependency).
 ///
 /// `activity` carries live OSC 9999 capture ([`AgentActivity`]); when present
@@ -49,8 +54,8 @@ pub struct SidebarEntry {
 
 /// Recommend a sidebar width that keeps the longest workspace/agent label
 /// readable while reserving a usable pane area on the right. The configured
-/// width remains the floor; the width is only expanded when the terminal can
-/// spare the requested space.
+/// width is the preferred size; narrow terminals may shrink it to the compact
+/// one-line layout instead of hiding workspace navigation entirely.
 #[must_use]
 pub fn recommended_width(
     entries: &[SidebarEntry],
@@ -81,8 +86,9 @@ pub fn recommended_width(
         .unwrap_or(0);
     let desired = configured_width.max(required_inner.saturating_add(2));
     let max_sidebar = terminal_width.saturating_sub(min_content_width.saturating_add(1));
-    if max_sidebar < configured_width {
-        configured_width
+    let minimum = configured_width.min(MIN_COMPACT_WIDTH);
+    if max_sidebar < minimum {
+        0
     } else {
         desired.min(max_sidebar)
     }
@@ -720,6 +726,21 @@ mod tests {
         let width = recommended_width(&entries, 26, 80, 22);
         assert!(width > 26, "long workspace name should widen the sidebar");
         assert!(width + 1 + 22 <= 80, "pane area remains usable");
+    }
+
+    #[test]
+    fn recommended_width_uses_compact_sidebar_on_narrow_terminal() {
+        let entries = vec![SidebarEntry {
+            name: "input-pc/feat/arch-refact-mac".to_owned(),
+            state: AgentState::Idle,
+            branch: None,
+            activity: None,
+            focused: false,
+            pinned: false,
+        }];
+
+        assert_eq!(recommended_width(&entries, 26, 40, 22), 17);
+        assert_eq!(recommended_width(&entries, 26, 38, 22), 0);
     }
 
     #[test]

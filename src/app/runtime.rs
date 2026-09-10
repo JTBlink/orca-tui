@@ -5373,6 +5373,33 @@ mod tests {
     }
 
     #[test]
+    fn render_narrow_terminal_keeps_workspace_sidebar_visible() {
+        let mut app = App::for_test(vec![pane(0, "bash")]);
+        app.set_workspace_catalog(vec![OrcaWorkspace {
+            id: "repo::/workspace".to_owned(),
+            path: PathBuf::from("/workspace"),
+            branch: "feature/sidebar".to_owned(),
+            display_name: "ws".to_owned(),
+            repo_id: "repo".to_owned(),
+            project_id: None,
+            host_id: Some("local".to_owned()),
+            catalog_source_host_id: None,
+            is_archived: false,
+            workspace_status: None,
+            is_main_worktree: false,
+        }]);
+        app.terminal.backend_mut().resize(40, 24);
+
+        app.render().expect("render narrow terminal");
+
+        let text = buffer_text(&app);
+        assert!(
+            text.contains("repo/ws"),
+            "workspace sidebar must remain visible when a compact sidebar fits:\n{text}"
+        );
+    }
+
+    #[test]
     fn render_with_sidebar_hidden_still_works() {
         let mut app = App::for_test(vec![pane(0, "solo")]);
         app.sidebar_hidden = true;
