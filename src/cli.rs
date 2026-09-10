@@ -1,6 +1,6 @@
 //! # CLI
 //!
-//! Argument parsing and subcommand dispatch for the `orcatui` binary. Kept in
+//! Argument parsing and subcommand dispatch for the `orca-tui` binary. Kept in
 //! the library (not `main.rs`) so the dispatch logic is unit-testable and the
 //! binary stays a one-line entry point.
 
@@ -28,7 +28,7 @@ pub fn run() -> Result<()> {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "orcatui",
+    name = "orca-tui",
     version = VERSION,
     about = "Terminal multi-agent coding orchestrator (TUI port of Orca GUI)"
 )]
@@ -44,8 +44,8 @@ enum Command {
     /// The trailing command list is split into per-agent commands on the
     /// literal `::` separator, and each command gets its own pane, e.g.
     ///
-    /// - `orcatui run -- claude codex opencode` → three side-by-side panes.
-    /// - `orcatui run -- claude :: codex --model x :: opencode` → three panes;
+    /// - `orca-tui run -- claude codex opencode` → three side-by-side panes.
+    /// - `orca-tui run -- claude :: codex --model x :: opencode` → three panes;
     ///   the middle agent's command is `codex --model x`.
     ///
     /// **Splitting rule:** if any `::` is present the list is split into the
@@ -147,11 +147,11 @@ enum Command {
 
     /// Start the built-in daemon server (run as a systemd/supervisor service).
     ///
-    /// Owns agent PTYs and serves `orcatui attach` clients over a Unix socket.
+    /// Owns agent PTYs and serves `orca-tui attach` clients over a Unix socket.
     /// Agents survive client disconnect — the daemon keeps running until all
     /// agents exit and no clients remain, or until SIGTERM.
     ///
-    /// Designed for `systemctl --user start orcatui` or equivalent. Logs to
+    /// Designed for `systemctl --user start orca-tui` or equivalent. Logs to
     /// stdout/stderr (captured by journald/supervisor).
     Daemon {
         /// Unix socket path. Defaults to `$XDG_RUNTIME_DIR/orcatui.sock`.
@@ -168,7 +168,7 @@ enum Command {
         command: Vec<String>,
     },
 
-    /// Attach to a running orcatui daemon as a TUI client.
+    /// Attach to a running orca-tui daemon as a TUI client.
     ///
     /// Connects to the daemon's Unix socket, renders all live agent panes,
     /// and forwards keyboard input. Multiple clients can attach simultaneously.
@@ -271,7 +271,7 @@ fn dispatch_command(command: Command) -> Result<()> {
                         ));
                     })?;
                 eprintln!(
-                    "orcatui: mobile companion — ws://{addr}?token={token} \
+                    "orca-tui: mobile companion — ws://{addr}?token={token} \
                      (live pane status while the agents run)"
                 );
                 app.set_snapshot_sender(snap_tx);
@@ -324,7 +324,7 @@ fn dispatch_command(command: Command) -> Result<()> {
             let source = if issues.is_some() { "issues" } else { "spec" };
             let mode = if parallel { "parallel" } else { "sequential" };
             println!(
-                "orcatui: orchestrating {} task(s) via agent `{agent_bin}` \
+                "orca-tui: orchestrating {} task(s) via agent `{agent_bin}` \
                  ({mode}, source: {source}, task text passed as the prompt):",
                 coord.tasks().len()
             );
@@ -344,7 +344,7 @@ fn dispatch_command(command: Command) -> Result<()> {
             let repo = RepoRef::parse(&repo)?;
             let prs = integrations::list_pull_requests(&repo)?;
             if prs.is_empty() {
-                println!("orcatui: no open pull requests for {repo}");
+                println!("orca-tui: no open pull requests for {repo}");
             }
             for pr in prs {
                 match &pr.branch {
@@ -359,7 +359,7 @@ fn dispatch_command(command: Command) -> Result<()> {
             let repo = RepoRef::parse(&repo)?;
             let issues = integrations::list_issues(&repo)?;
             if issues.is_empty() {
-                println!("orcatui: no open issues for {repo}");
+                println!("orca-tui: no open issues for {repo}");
             }
             for iss in issues {
                 println!("#{}  {}", iss.number, iss.title);
@@ -374,7 +374,7 @@ fn dispatch_command(command: Command) -> Result<()> {
             // the server is up and accepting connections (clients hold socket).
             let (_snapshot_tx, snapshot_rx) =
                 tokio::sync::mpsc::unbounded_channel::<Vec<mobile::AgentSnapshot>>();
-            println!("orcatui: mobile companion server");
+            println!("orca-tui: mobile companion server");
             println!("  listen: ws://{addr}");
             println!("  token: {token}");
             println!("  (connect a mobile client to ws://{addr}?token={token})");
@@ -423,7 +423,7 @@ fn dispatch_command(command: Command) -> Result<()> {
 fn prepare_run_specs(command: Vec<String>, remote: Option<&str>) -> Result<Vec<AgentSpec>> {
     let commands = split_agents(command);
     if commands.is_empty() {
-        anyhow::bail!("no agent command given — usage: orcatui run -- <command>...");
+        anyhow::bail!("no agent command given — usage: orca-tui run -- <command>...");
     }
     let mut specs: Vec<AgentSpec> = commands.into_iter().map(AgentSpec::from_command).collect();
     if let Some(host) = remote {

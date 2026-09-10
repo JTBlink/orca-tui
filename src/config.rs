@@ -2,7 +2,7 @@
 //!
 //! User configuration loaded from `~/.config/orcatui/config.toml` (or
 //! `$XDG_CONFIG_HOME/orcatui/config.toml`). Everything has a built-in default,
-//! so orcatui runs with zero configuration; the file only overrides what the
+//! so orca-tui runs with zero configuration; the file only overrides what the
 //! user sets.
 //!
 //! ```toml

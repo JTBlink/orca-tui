@@ -21,7 +21,7 @@
 /// # Examples
 ///
 /// ```
-/// # use orcatui::hangul::compose_syllable;
+/// # use orca_tui::hangul::compose_syllable;
 /// // ㅇ (U+3147) + ㅏ (U+314F) + ㄴ (U+3134) -> 안 (U+C548).
 /// assert_eq!(compose_syllable("\u{3147}\u{314F}\u{3134}"), Some('\u{C548}'));
 /// ```

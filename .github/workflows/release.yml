@@ -1,0 +1,171 @@
+name: Release packages
+
+# 发布流程参考 Orca 的“验证门禁 → 矩阵构建 → 汇总发布”结构。
+# 推送 v* 标签时自动运行，也可以在 Actions 中手动指定已有标签重发。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要打包的版本标签（例如 v0.5.0）
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Release verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked -- --test-threads=1
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features
+
+  package:
+    name: Package ${{ matrix.name }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macOS x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: macOS arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Validate tag and crate version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag must be a stable semantic version such as v0.5.0: $RELEASE_TAG"
+            exit 1
+          fi
+          crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "orca-tui") | .version')"
+          tag_version="${RELEASE_TAG#v}"
+          if [[ "$crate_version" != "$tag_version" ]]; then
+            echo "::error::Cargo version $crate_version does not match tag $RELEASE_TAG"
+            exit 1
+          fi
+
+      - name: Build release binaries
+        run: cargo build --release --locked --bins --target ${{ matrix.target }}
+
+      - name: Create archive and checksum
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          archive="orca-tui-${version}-${TARGET}"
+          staging="dist/${archive}"
+          mkdir -p "$staging"
+          cp "target/${TARGET}/release/orca-tui" "$staging/"
+          cp "target/${TARGET}/release/orca-tui-inject" "$staging/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$staging/"
+          tar -C dist -czf "dist/${archive}.tar.gz" "$archive"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${archive}.tar.gz" > "${archive}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256")
+          fi
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub release
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: package-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/*.tar.gz* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/*.tar.gz* \
+              --title "orca-tui $RELEASE_TAG" \
+              --generate-notes \
+              --verify-tag
+          fi

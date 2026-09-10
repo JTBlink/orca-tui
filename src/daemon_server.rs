@@ -1,7 +1,7 @@
 //! # Built-in daemon server
 //!
 //! A lightweight Rust daemon that owns agent PTYs and serves one or more
-//! `orcatui attach` clients over a Unix socket. Designed to run as a
+//! `orca-tui attach` clients over a Unix socket. Designed to run as a
 //! systemd/supervisor service — it stays in the foreground, logs to
 //! stdout/stderr, and exits cleanly on SIGTERM.
 //!
@@ -209,7 +209,7 @@ impl DaemonServer {
         })
     }
 
-    /// Spawn an initial set of agents (from `orcatui daemon -- claude :: codex`).
+    /// Spawn an initial set of agents (from `orca-tui daemon -- claude :: codex`).
     pub fn spawn_initial(&mut self, commands: Vec<Vec<String>>, cols: u16, rows: u16) {
         for cmd in commands {
             let name = cmd

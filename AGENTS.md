@@ -6,7 +6,7 @@
 
 - `src/` 包含应用、TUI 状态机、PTY 与终端模拟、daemon 客户端/服务端、外部集成、worktree
   管理和配置代码。
-- `src/main.rs` 是 `orcatui` 入口；`src/bin/inject.rs` 构建 `orcatui-inject` 排查工具。
+- `src/main.rs` 是 `orca-tui` 入口；`src/bin/inject.rs` 构建 `orca-tui-inject` 排查工具。
 - 单元测试与实现代码放在同一文件中，位于 `src/**/*.rs` 的 `#[cfg(test)]` 模块内。
 - `docs/TECHNICAL-DESIGN.md` 记录架构和协议边界。
 - `.agents/skills/` 存放仓库级 contributor skill；其中不得包含凭据、个人路径或其他敏感信息。
@@ -25,7 +25,7 @@ cargo bench --bench orca            # 运行 Criterion 基准测试
 ```
 
 使用 `cargo fmt` 应用格式化。排查终端渲染问题时，使用
-`cargo run --bin orcatui-inject -- record ...` 和 `replay ...` 确定性复现 PTY 输出。
+`cargo run --bin orca-tui-inject -- record ...` 和 `replay ...` 确定性复现 PTY 输出。
 
 ## 编码风格与命名
 

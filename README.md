@@ -1,10 +1,14 @@
-# orcatui
+# orca-tui
 
-`orcatui` 是一个终端多 Agent 编排工具。它把 Claude Code、Codex、OpenCode、Gemini CLI
+`orca-tui` 是一个终端多 Agent 编排工具。它把 Claude Code、Codex、OpenCode、Gemini CLI
 等命令行 Agent 运行在独立 PTY 中，并在同一个 TUI 里并排展示、切换和管理。
 
 项目支持直接管理本机 PTY、连接内置 daemon，以及连接 Orca GUI daemon。当前 crate 版本为
-`0.4.8`。
+`0.5.0`。
+
+推送形如 `v0.5.0` 的 Git 标签会触发 GitHub Actions 自动验证、构建并发布 Linux（x86_64、
+aarch64）和 macOS（x86_64、arm64）压缩包；每个压缩包同时附带 SHA-256 校验文件。也可以在
+Actions 页面手动运行 `Release packages`，指定一个已有标签重新发布构建产物。
 
 ## 主要能力
 
@@ -17,7 +21,7 @@
 - 内置 daemon 持久会话和多客户端 attach
 - Orca GUI daemon v36 客户端
 - 移动端 WebSocket 状态服务
-- `orcatui-inject` 终端录制 / 回放工具
+- `orca-tui-inject` 终端录制 / 回放工具
 
 ## 环境要求
 
@@ -31,29 +35,32 @@
 
 ```bash
 # 从 crates.io 安装
-cargo install orcatui
+cargo install orca-tui
 
 # 从当前源码安装
 cargo install --path .
 
 # 自动检测 Agent，未检测到时使用 bash
-orcatui
+orca-tui
+
+# 在源码目录直接启动（自动复用已构建二进制）
+./orca-tui.sh
 ```
 
 运行 Agent：
 
 ```bash
 # 单个 Agent
-orcatui run -- claude
+orca-tui run -- claude
 
 # 不含 :: 时，每个 token 都是一个 Agent
-orcatui run -- claude codex opencode
+orca-tui run -- claude codex opencode
 
 # 含 :: 时，按段分组，可为 Agent 传参数
-orcatui run -- claude :: codex --model gpt-5 :: opencode
+orca-tui run -- claude :: codex --model gpt-5 :: opencode
 
 # 指定工作目录和独立 worktree
-orcatui run --cwd ./my-repo --worktree -- claude :: codex
+orca-tui run --cwd ./my-repo --worktree -- claude :: codex
 ```
 
 参数分组规则：没有 `::` 时，`--` 后每个 token 启动一个 Agent；出现至少一个 `::` 后，
@@ -63,18 +70,18 @@ orcatui run --cwd ./my-repo --worktree -- claude :: codex
 
 | 模式 | 命令 | 会话持久化 | 说明 |
 |---|---|:---:|---|
-| 独立模式 | `orcatui run -- claude` | 否 | 当前进程直接创建和管理 PTY |
-| 内置 daemon | `orcatui daemon -- claude` + `orcatui attach` | 是 | daemon 持有 PTY，可多客户端连接 |
-| Orca GUI daemon | `orcatui run --daemon -- claude` | 是 | 连接 Orca GUI v36，失败时回退独立模式 |
+| 独立模式 | `orca-tui run -- claude` | 否 | 当前进程直接创建和管理 PTY |
+| 内置 daemon | `orca-tui daemon -- claude` + `orca-tui attach` | 是 | daemon 持有 PTY，可多客户端连接 |
+| Orca GUI daemon | `orca-tui run --daemon -- claude` | 是 | 连接 Orca GUI v36，失败时回退独立模式 |
 
 ### 内置 daemon
 
 ```bash
 # 前台启动 daemon
-orcatui daemon -- claude :: codex
+orca-tui daemon -- claude :: codex
 
 # 在另一个终端连接
-orcatui attach
+orca-tui attach
 ```
 
 默认 socket 为 `$XDG_RUNTIME_DIR/orcatui.sock`；未设置时为 `/tmp/orcatui.sock`。两端都可以
@@ -83,7 +90,7 @@ orcatui attach
 ### Orca GUI daemon
 
 ```bash
-orcatui run --daemon -- claude :: codex
+orca-tui run --daemon -- claude :: codex
 ```
 
 客户端会自动查找 Orca daemon v36 的 socket 和 token。找不到 daemon 或握手失败时继续以独立
@@ -94,13 +101,13 @@ orcatui run --daemon -- claude :: codex
 
 ```bash
 # 通过 SSH 在远端执行 Agent
-orcatui run --remote user@example.com --reconnect -- claude :: codex
+orca-tui run --remote user@example.com --reconnect -- claude :: codex
 
 # 随 Agent 启动移动端状态服务
-orcatui run --mobile 8080 -- claude
+orca-tui run --mobile 8080 -- claude
 
 # 单独启动移动端 WebSocket 服务
-orcatui mobile --port 8080
+orca-tui mobile --port 8080
 ```
 
 `--remote` 支持 `host`、`user@host` 和 `user@host:port`。移动服务启动后会输出地址和一次性
@@ -141,20 +148,20 @@ Tasks 视图需要输入 `owner/name` 格式的 GitHub 仓库。选择 issue 或
 ## CLI 参考
 
 ```text
-orcatui run [--cwd DIR] [--worktree] [--daemon] [--remote HOST] [--reconnect] [--mobile PORT] -- COMMAND...
-orcatui daemon [--socket PATH] [-- COMMAND...]
-orcatui attach [--socket PATH]
-orcatui orchestrate [--spec TEXT | --issues OWNER/NAME] [--parallel]
-orcatui prs OWNER/NAME
-orcatui issues OWNER/NAME
-orcatui mobile [--port PORT]
+orca-tui run [--cwd DIR] [--worktree] [--daemon] [--remote HOST] [--reconnect] [--mobile PORT] -- COMMAND...
+orca-tui daemon [--socket PATH] [-- COMMAND...]
+orca-tui attach [--socket PATH]
+orca-tui orchestrate [--spec TEXT | --issues OWNER/NAME] [--parallel]
+orca-tui prs OWNER/NAME
+orca-tui issues OWNER/NAME
+orca-tui mobile [--port PORT]
 ```
 
 以当前二进制为准：
 
 ```bash
-orcatui --help
-orcatui run --help
+orca-tui --help
+orca-tui run --help
 ```
 
 `orchestrate --spec` 将每个非空行转换为任务，默认顺序执行；`--parallel` 并行派发。
@@ -202,11 +209,11 @@ cargo test
 cargo clippy --all-targets --all-features
 ```
 
-终端渲染问题可用 `orcatui-inject` 确定性复现：
+终端渲染问题可用 `orca-tui-inject` 确定性复现：
 
 ```bash
-orcatui-inject record --for-secs 8 --size 80x24 --out recording.bin -- opencode
-orcatui-inject replay recording.bin --size 80x24 --chunk 256 --render
+orca-tui-inject record --for-secs 8 --size 80x24 --out recording.bin -- opencode
+orca-tui-inject replay recording.bin --size 80x24 --chunk 256 --render
 ```
 
 设置 `ORCA_DEBUG_LOG=1` 会把底层数据和 resize 日志写入 `/tmp/orca-live.log`；
