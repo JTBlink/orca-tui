@@ -402,6 +402,17 @@ fn parse_hex(s: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// `HOME` and `XDG_CONFIG_HOME` are process-global. Keep every config test
+    /// that reads or mutates them in one critical section so Rust's parallel
+    /// test runner cannot redirect another test between `save()` and `load()`.
+    fn config_env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn defaults_are_orca_dark() {
@@ -514,6 +525,7 @@ border = "#abcdef"
 
     #[test]
     fn missing_file_uses_default() {
+        let _env_guard = config_env_lock();
         // load_or_default never panics even with no config file / env.
         let cfg = Config::load_or_default();
         assert_eq!(cfg.default_agent, "bash");
@@ -560,6 +572,7 @@ border = "#abcdef"
 
     #[test]
     fn load_or_default_and_config_path_branches() {
+        let _env_guard = config_env_lock();
         // This test manipulates process-global env vars. To stay safe under
         // the parallel test runner (and panic-safe on a failed assertion) it
         // (a) performs all env reads FIRST, (b) restores env BEFORE asserting,
@@ -648,6 +661,7 @@ border = "#abcdef"
 
     #[test]
     fn save_round_trips_through_load() {
+        let _env_guard = config_env_lock();
         // Mutate a Config to values that differ from the defaults, then verify
         // a serialize → parse round-trip preserves them. This exercises the
         // `save()` serialization shape without depending on a writable real
@@ -706,6 +720,7 @@ border = "#abcdef"
 
     #[test]
     fn save_returns_err_without_config_dir() {
+        let _env_guard = config_env_lock();
         // When neither HOME nor XDG_CONFIG_HOME is set, config_path() is None
         // and save() must surface a clear error rather than panic. Env vars
         // are restored before asserting (panic-safe).
