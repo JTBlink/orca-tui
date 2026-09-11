@@ -83,6 +83,8 @@ pub(crate) enum InputCommand {
     SetNormalMode,
     Forward(KeyEvent),
     Focus(FocusDirection),
+    NextTab,
+    PreviousTab,
     TogglePin,
     ClosePane,
     ToggleZoom,
@@ -111,12 +113,43 @@ pub(crate) fn reduce_key(mode: InputMode, key: KeyEvent) -> Option<InputCommand>
     }
 
     match mode {
-        InputMode::Normal => Some(InputCommand::Forward(key)),
+        InputMode::Normal => match key.code {
+            // Tabs are navigation chrome, not bytes for the active PTY. This
+            // keeps tab switching available without first entering a control
+            // mode, while every other key remains a transparent PTY passthrough.
+            KeyCode::Tab
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                Some(InputCommand::NextTab)
+            }
+            KeyCode::BackTab
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                Some(InputCommand::PreviousTab)
+            }
+            _ => Some(InputCommand::Forward(key)),
+        },
         InputMode::Pane => {
             let command = match key.code {
                 KeyCode::Esc => InputCommand::SetNormalMode,
-                KeyCode::Tab => InputCommand::Focus(FocusDirection::Right),
-                KeyCode::BackTab => InputCommand::Focus(FocusDirection::Left),
+                KeyCode::Tab
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    InputCommand::NextTab
+                }
+                KeyCode::BackTab
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    InputCommand::PreviousTab
+                }
                 KeyCode::Up | KeyCode::Char('k') => InputCommand::Focus(FocusDirection::Up),
                 KeyCode::Down | KeyCode::Char('j') => InputCommand::Focus(FocusDirection::Down),
                 KeyCode::Left | KeyCode::Char('h') => InputCommand::Focus(FocusDirection::Left),
@@ -178,6 +211,17 @@ mod tests {
         assert_eq!(
             reduce_key(InputMode::Pane, key(KeyCode::Char('z'), KeyModifiers::NONE)),
             Some(InputCommand::ToggleZoom)
+        );
+        assert_eq!(
+            reduce_key(InputMode::Normal, key(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(InputCommand::NextTab)
+        );
+        assert_eq!(
+            reduce_key(
+                InputMode::Normal,
+                key(KeyCode::BackTab, KeyModifiers::SHIFT)
+            ),
+            Some(InputCommand::PreviousTab)
         );
     }
 

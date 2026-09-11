@@ -5,8 +5,10 @@
 
 ## 目标与运行路径
 
-`orcatui` 在一个 ratatui 界面中运行和观察多个命令行 Agent。每个 Agent 都有独立 PTY、
-终端模拟状态和窗格；`App` 负责输入路由、生命周期、布局、状态聚合和可选编排。
+`orcatui` 在一个 ratatui 界面中运行和观察多个命令行 Agent。独立模式下每个 Agent 有本机
+PTY；Orca daemon 模式下每个 tab 对应 daemon 已持有的共享 PTY session。当前窗口只绘制活动
+tab 的一个真实终端表面，切换 tab 不会销毁或重建后台会话。`App` 负责输入路由、生命周期、
+布局、状态聚合和可选编排。
 
 当前有三条互相独立的路径：
 
@@ -15,8 +17,8 @@
 
 内置 daemon：Agent <-> DaemonServer <-> Unix socket <-> AttachClient <-> TUI
 
-Orca daemon：Orca daemon --control/stream sockets-->
-             DaemonClient <-> App <-> Pane <-> ratatui
+Orca daemon：Orca daemon（共享 PTY sessions）
+             --control/stream sockets--> DaemonClient <-> App <-> Pane <-> ratatui
 ```
 
 内置 daemon 和 Orca GUI daemon 不是同一个服务，协议不能混用。代码分别位于
@@ -31,7 +33,7 @@ Orca daemon：Orca daemon --control/stream sockets-->
 |---|---|
 | `src/core/` | Agent 身份、活动记录、任务协调等领域状态 |
 | `src/app/` | CLI、应用状态机、输入命令、事件总线和帧调度 |
-| `src/ui/` | 布局、Pane、Sidebar、Overlay、Toast 和渲染模型 |
+| `src/ui/` | 布局、Pane、Sidebar、TabBar、Overlay、Toast 和渲染模型 |
 | `src/terminal/` | PTY 生命周期、终端模拟和 OSC/查询/同步输出协议 |
 | `src/orca/` | Orca daemon 协议与跨 host workspace catalog |
 | `src/adapters/` | 内置 daemon、Git/GitHub、SSH、移动端和剪贴板适配 |
@@ -42,14 +44,14 @@ Orca daemon：Orca daemon --control/stream sockets-->
 | 模块 | 职责 |
 |---|---|
 | `cli.rs` | clap 参数、命令分发、Agent 参数分组 |
-| `app.rs` | 主循环、输入状态机、窗格管理、渲染和运行时编排 |
+| `app.rs` | 主循环、输入状态机、终端 tab 管理、渲染和运行时编排 |
 | `agent.rs` | Agent 类型、命令规范和生命周期状态 |
 | `bus.rs` | PTY/daemon 输出到应用的事件通道 |
 | `pane.rs` | 单个终端的模拟、滚动、选择和边框 |
 | `pty_session.rs` | 本机 PTY 创建、写入、resize、退出和回收 |
 | `terminal_emu.rs` | vt100 ANSI 解析与 cell 网格 |
 | `query.rs` / `osc.rs` / `sync.rs` | 终端能力查询、活动 OSC、mode 2026 同步输出 |
-| `scheduler.rs` / `layout.rs` / `sidebar.rs` | 刷新调度、网格布局和侧边栏 |
+| `scheduler.rs` / `layout.rs` / `sidebar.rs` / `tab_bar.rs` | 刷新调度、兼容网格算法、侧边栏和终端 tabs |
 | `daemon_server.rs` | 内置 daemon、attach 协议和会话持有 |
 | `orca_daemon.rs` | Orca GUI daemon v36 客户端 |
 | `orca_workspaces.rs` | Orca CLI 全局 workspace catalog 读取、完整性校验和降级 |
@@ -75,7 +77,7 @@ PTY bytes
 ```
 
 子进程会注入 `TERM=xterm-256color` 和 `COLORTERM=truecolor`。应用按帧批量消费
-`AgentUpdate`，由 `FrameScheduler` 控制 60 FPS 目标和空闲退避。窗格边框使用
+`AgentUpdate`，由 `FrameScheduler` 控制 60 FPS 目标和空闲退避。终端边框使用
 `ratatui-ppalla` 的 `PreparedBlock`，终端 cell 仍由 ratatui 完整绘制。
 
 `--worktree` 时，`WorktreeManager` 在仓库根目录的 `.orca-worktrees/` 下创建
@@ -96,16 +98,21 @@ daemon 持有 PTY，attach 客户端断开不影响 Agent。默认 socket 是
 
 ## Orca GUI daemon v36
 
-`orca_daemon::PROTOCOL_VERSION` 当前为 `36`。客户端连接两个 Unix socket：control 使用
-NDJSON RPC，stream 使用二进制帧：
-
-```text
-[1 byte type][4 byte big-endian payload length][payload]
-```
-
-帧类型 `1` 为 PTY 数据，`2` 为 NDJSON 事件，单帧上限为 16 MiB。两个 socket 都要发送
+`orca_daemon::PROTOCOL_VERSION` 当前为 `36`。客户端连接两个 Unix socket：control 和 stream
+均使用逐行 NDJSON；stream 每行是带 `sessionId` 的 `event=data`、`event=exit` 等事件，PTY
+内容位于 `payload.data`。客户端仍保留旧二进制帧兼容读取路径。两个 socket 都要发送
 带 token、`clientId` 和 role 的 hello；control 与 stream 的 `daemonIdentity` 必须对应同一
 daemon 实例。发现逻辑查找 Orca 的 versioned `daemon-v36.sock` / token，并兼容旧布局。
+
+连接完成后先调用 `listSessions`，过滤 `isAlive=false` 的记录；每个 live session 使用
+`createOrAttach` 且设置 `attachOnly=true`，把 `scrollbackAnsi + rehydrateSequences +
+snapshotAnsi` 注入对应 tab 的终端模拟器。启动阶段只 hydrate Orca 已有终端，不会因 CLI
+参数隐式创建 agent；tab 栏 `+`、`n` 或自定义命令入口才触发显式 `createOrAttach`。随后将
+stream 事件按 session ID 路由，输入和 resize 通过 daemon RPC 发回，PTY 生命周期始终由
+Orca daemon 管理。由于 daemon `listSessions` 只提供 PTY 状态，启动/重连时另行读取
+`orca terminal list --include-visual-layouts --json`，按稳定 `ptyId` 合并 Orca 的标题、
+`agentIdentity` 和视觉顺序；匹配不到的 live session 仍保留，但使用 daemon 的安全回退标签，
+并写入脱敏诊断计数。关闭 tab/退出 TUI 默认只断开当前展示客户端，不杀掉 Orca 会话。
 
 维护协议适配时，必须同时核对 `src/orca/daemon.rs` 与同级 `../orca/src/main/daemon/` 中的
 client、stream reader、request router 和测试。不要仅依据旧文档中的字段名或帧格式。
@@ -157,7 +164,7 @@ cargo test
 cargo clippy --all-targets --all-features
 ```
 
-`orcatui-inject` 用于录制和回放终端字节；`ORCA_DEBUG_LOG=1` 写入
+可选的 `orca-tui-inject` 用于录制和回放终端字节（启用 `inject` feature）；`ORCA_DEBUG_LOG=1` 写入
 `/tmp/orca-live.log`。当前实现还存在以下边界，修复时应补回归测试：
 
 - daemon 初始窗格、daemon stream 断线、关闭 daemon 窗格和动态命令参数需要保持一致的会话语义。
@@ -177,3 +184,21 @@ cargo clippy --all-targets --all-features
   仅当 Orca CLI 不可用时才回退到当前 Git 仓库的 `git worktree list`，不能把 Git 当前仓库的
   数量当作全局工作台总数。`attach` 会将 daemon session 与这份 catalog 并列渲染，daemon
   协议不负责提供 workspace inventory。
+
+## Workspace 与终端 Tab 布局
+
+主界面遵循 Herdr 的层级：左侧常驻 workspace 导航，右侧顶部为 tab strip，剩余区域是活动
+tab 的单个终端 surface：
+
+```text
+┌──────────────┬──────────────────────────────────────┐
+│ workspaces   │ [● tab-1] [○ tab-2] [+]              │
+│              ├──────────────────────────────────────┤
+│              │ 当前活动 tab 的完整 PTY 终端          │
+└──────────────┴──────────────────────────────────────┘
+```
+
+tab 只是视图选择器；所有 tab 复用同一个 TUI 终端 surface，后端会话由 `PaneSlot` 持续消费，
+切回时直接显示最新状态。鼠标点击 tab、`+` 或左侧 workspace 均可导航；普通模式下 `Tab` /
+`Shift+Tab` 也会循环切换 tab。这样终端尺寸按整个内容区同步给活动 PTY，不再按 split pane
+网格缩小，fullscreen TUI 与真实当前终端的行为保持一致。

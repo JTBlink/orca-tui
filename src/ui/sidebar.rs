@@ -309,6 +309,75 @@ pub fn render_sidebar(
     }
 }
 
+/// Return the visible hit box for each sidebar entry. The vector is indexed by
+/// the original `entries` slice; entries that are currently windowed out have
+/// `None`. Keeping hit testing beside the renderer prevents mouse activation
+/// from drifting when the sidebar adds status/pinned section headers.
+#[must_use]
+pub fn entry_hit_rects(
+    area: Rect,
+    entries: &[SidebarEntry],
+    status_present: bool,
+) -> Vec<Option<Rect>> {
+    let mut out = vec![None; entries.len()];
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    if inner.width == 0 || inner.height == 0 {
+        return out;
+    }
+    let show_summary = !entries.is_empty() && inner.height >= 8;
+    let entry_bottom = if show_summary {
+        inner.bottom().saturating_sub(1)
+    } else {
+        inner.bottom()
+    };
+    let lines_each = entry_lines(inner.width);
+    let mut y = inner.y;
+    if status_present {
+        y = y.saturating_add(1);
+    }
+    if entries.iter().any(|e| e.pinned) {
+        y = y.saturating_add(1); // PINNED header
+        for (idx, _entry) in entries.iter().enumerate().filter(|(_, e)| e.pinned) {
+            let draw = entry_bottom.saturating_sub(y).min(lines_each);
+            if draw == 0 {
+                break;
+            }
+            out[idx] = Some(Rect::new(inner.x, y, inner.width, draw));
+            y = y.saturating_add(draw);
+        }
+    }
+    y = y.saturating_add(1); // IN PROGRESS header
+    let unpinned: Vec<(usize, &SidebarEntry)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.pinned)
+        .collect();
+    let fits = if lines_each == 0 {
+        0
+    } else {
+        usize::from(entry_bottom.saturating_sub(y) / lines_each)
+    };
+    let max_start = unpinned.len().saturating_sub(fits);
+    let start = match unpinned.iter().position(|(_, e)| e.focused) {
+        Some(f) if fits > 0 => f.saturating_sub(fits / 2).min(max_start),
+        _ => unpinned.len().saturating_sub(fits),
+    };
+    for (idx, _) in unpinned.iter().skip(start) {
+        let draw = entry_bottom.saturating_sub(y).min(lines_each);
+        if draw == 0 {
+            break;
+        }
+        out[*idx] = Some(Rect::new(inner.x, y, inner.width, draw));
+        y = y.saturating_add(draw);
+    }
+    out
+}
+
 /// Whether an entry counts as "in progress" for the section header. Derived
 /// via the unified [`AgentStatus`] model: Working/Blocked/Waiting are all
 /// active. (A `Running` process whose OSC payload reports `blocked` or
@@ -394,6 +463,15 @@ fn render_entry_row(
     // Branch / model: right-aligned, dim. Rendered first so left-side content
     // truncates before it instead of running underneath it.
     let branch = visible_branch(entry);
+    let name_width = u16::try_from(disp_width(&entry.name)).unwrap_or(u16::MAX);
+    // On compact sidebars preserve the workspace name as the primary
+    // navigation target. The secondary branch/model is omitted when showing
+    // both would truncate the name to an ambiguous prefix (for example
+    // `repo/ws` becoming `repo/w`).
+    let branch = branch.filter(|_| {
+        let bw = u16::try_from(disp_width(branch.unwrap_or(""))).unwrap_or(u16::MAX);
+        bw.saturating_add(name_width).saturating_add(5) <= width
+    });
     let bw = u16::try_from(branch.map_or(0, disp_width)).unwrap_or(0);
     let left_end = if bw > 0 && bw.saturating_add(2) <= width {
         let bx = right.saturating_sub(bw);

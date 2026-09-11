@@ -38,6 +38,9 @@
 //!   client thread ──command──▶ event channel ──▶ main loop ──▶ PtySession
 //! ```
 
+use anyhow::{Context, Result};
+use base64::{engine::general_purpose, Engine as _};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -46,9 +49,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use anyhow::{Context, Result};
-use base64::{engine::general_purpose, Engine as _};
-use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentState;
 use crate::pty_session::PtySession;
@@ -635,6 +635,25 @@ impl AttachClient {
         }))
     }
 
+    /// Ask the daemon to create a new shell-backed terminal session. The
+    /// asynchronous `created` response is delivered on the normal client
+    /// stream and includes the stable session id.
+    pub fn create_session(
+        &mut self,
+        name: &str,
+        command: &[String],
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        self.send_command(&serde_json::json!({
+            "type": "create",
+            "name": name,
+            "command": command,
+            "cols": cols,
+            "rows": rows,
+        }))
+    }
+
     /// Resize a session.
     ///
     /// # Errors
@@ -665,6 +684,7 @@ impl AttachClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     #[test]
     fn session_info_serializes() {

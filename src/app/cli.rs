@@ -56,13 +56,13 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// 在窗格中运行一个或多个智能体。
+    /// 在终端 tabs 中运行一个或多个智能体。
     ///
     /// 尾部的命令列表以 `::` 分隔符分割为各智能体的命令，每个命令
     /// 获得自己的窗格，例如：
     ///
-    /// - `orca-tui run -- claude codex opencode` → 三个并排窗格。
-    /// - `orca-tui run -- claude :: codex --model x :: opencode` → 三个窗格；
+    /// - `orca-tui run -- claude codex opencode` → 三个终端 tabs。
+    /// - `orca-tui run -- claude :: codex --model x :: opencode` → 三个 tabs；
     ///   中间智能体的命令为 `codex --model x`。
     ///
     /// **分割规则：**如果存在 `::` 则按 `::` 分割（开头/结尾/连续
@@ -79,14 +79,15 @@ enum Command {
         #[arg(long)]
         worktree: bool,
 
-        /// 为当前仓库中注册的每个 Git worktree 启动一个窗格。每个窗格在
+        /// 为当前仓库中注册的每个 Git worktree 启动一个终端 tab。每个 tab 在
         /// 对应 worktree 的检出目录中运行。
         #[arg(long)]
         all_worktrees: bool,
 
         /// 尝试连接到运行中的 Orca GUI 守护进程以实现会话持久化和多客户端
-        /// （GUI + TUI）。如果未找到守护进程或连接失败，则回退到独立模式
-        /// （直接 PTY）。
+        /// （GUI + TUI）。连接成功时仅展示/附加 Orca 已有终端，不会因尾部
+        /// 命令参数自动创建 agent；新终端请在 TUI 中使用 `+` 或 `n`。如果
+        /// 未找到守护进程或连接失败，则对显式命令回退到独立模式（直接 PTY）。
         #[arg(long)]
         daemon: bool,
 
@@ -106,13 +107,13 @@ enum Command {
         #[arg(long, value_name = "端口")]
         mobile: Option<u16>,
 
-        /// 一个或多个智能体调用。用 `::` 分隔的每个命令成为一个窗格。
+        /// 一个或多个智能体调用。用 `::` 分隔的每个命令成为一个终端 tab。
         /// 不含 `::` 时，每个词为一个智能体。`--` 之后的内容会被原样
         /// 捕获，包括针对智能体本身的标志。
         #[arg(
             trailing_var_arg = true,
             allow_hyphen_values = true,
-            num_args = 1..,
+            num_args = 0..,
             value_name = "命令",
         )]
         command: Vec<String>,
@@ -191,6 +192,22 @@ fn try_main(cli: Cli) -> Result<()> {
 /// Resolve the no-subcommand convenience behavior without mixing it into
 /// subcommand dispatch.
 fn default_command() -> Command {
+    // Prefer the Orca GUI daemon when its versioned endpoint is present. This
+    // makes a bare `orca-tui` launch a true viewer of every currently open
+    // Orca terminal instead of creating local worktree panes. The built-in
+    // daemon remains the fallback when no Orca GUI endpoint is discoverable.
+    if crate::orca_daemon::DaemonEndpoint::discover().is_some() {
+        return Command::Run {
+            cwd: None,
+            worktree: false,
+            all_worktrees: false,
+            daemon: true,
+            remote: None,
+            reconnect: false,
+            mobile: None,
+            command: Vec::new(),
+        };
+    }
     let socket = crate::daemon_server::default_socket_path();
     if socket.exists() {
         Command::Attach { socket: None }
@@ -226,6 +243,11 @@ fn dispatch_command(command: Command) -> Result<()> {
             mobile,
             command,
         } => {
+            if daemon && worktree {
+                anyhow::bail!(
+                    "--daemon cannot be combined with --worktree; Orca daemon owns workspace PTYs"
+                );
+            }
             // In worktree-isolation mode `cwd` must resolve to a git repo; if
             // the caller didn't pass --cwd, default to the current directory so
             // the repo can be discovered.
@@ -235,6 +257,9 @@ fn dispatch_command(command: Command) -> Result<()> {
                 cwd
             };
 
+            // Preserve the explicit command list so daemon mode can use it
+            // only if connection fails and we fall back to standalone PTYs.
+            let command_for_fallback = command.clone();
             let (specs, workspace_catalog) = if all_worktrees {
                 if daemon || worktree || reconnect {
                     anyhow::bail!(
@@ -243,19 +268,43 @@ fn dispatch_command(command: Command) -> Result<()> {
                 }
                 prepare_all_worktree_specs_with_catalog(command, cwd.as_deref(), remote.as_deref())?
             } else {
-                // The explicit command controls pane creation, not workspace
-                // visibility: keep the full Orca catalog in the sidebar and
-                // the `w` inventory view for every run mode.
+                // Keep the full Orca catalog in the sidebar and the `w`
+                // inventory view for every run mode. In daemon mode the
+                // explicit command is deliberately not a startup create;
+                // it is retained separately for standalone fallback.
                 let catalog = orca_workspaces::list_all_with_scope().unwrap_or_default();
-                (prepare_run_specs(command, remote.as_deref())?, catalog)
+                // A GUI daemon owns the PTYs that are already open in Orca.
+                // Startup in daemon mode is therefore an attach/hydrate
+                // operation; creating a terminal is an explicit in-TUI action
+                // (`+`, `n`, or the custom-command picker). Keep CLI command
+                // arguments available only for the standalone fallback below.
+                let specs = if daemon {
+                    Vec::new()
+                } else {
+                    prepare_run_specs(command, remote.as_deref())?
+                };
+                (specs, catalog)
             };
-
             let loaded_from_orca = workspace_catalog.loaded_from_orca;
             let unresolved_host_ids = workspace_catalog.unresolved_host_ids;
             let unverifiable_scope_host_ids = workspace_catalog.unverifiable_scope_host_ids;
             let catalog_rows = workspace_catalog.workspaces;
-            let mut app =
-                App::spawn_agents_with_catalog(specs, cwd.as_deref(), worktree, catalog_rows)?;
+            // In daemon mode do not create local PTYs before connecting. The
+            // app hydrates every live Orca session into a tab. Explicit
+            // terminal creation happens from the TUI; CLI commands are kept
+            // only for the no-daemon standalone fallback.
+            let launch_specs = if daemon { Vec::new() } else { specs };
+            let initial_specs = if daemon {
+                Vec::new()
+            } else {
+                launch_specs.clone()
+            };
+            let mut app = App::spawn_agents_with_catalog(
+                initial_specs,
+                cwd.as_deref(),
+                worktree,
+                catalog_rows,
+            )?;
             app.set_workspace_catalog_status(
                 loaded_from_orca,
                 unresolved_host_ids,
@@ -266,7 +315,36 @@ fn dispatch_command(command: Command) -> Result<()> {
             // standalone silently if no daemon is found; shows a toast if a
             // daemon was found but the connection failed.
             if daemon {
+                // Orca v36 keeps exactly one attachment owner per PTY
+                // session. Starting the viewer from inside an Orca terminal
+                // would therefore steal every GUI session's attachment and
+                // leave the GUI unable to receive input or output. There is
+                // no observer/read-only attachment role in this protocol, so
+                // fail closed instead of damaging the live Orca surface.
+                if std::env::var_os("ORCA_TERMINAL_HANDLE").is_some()
+                    || std::env::var("HERDR_ENV").as_deref() == Ok("1")
+                {
+                    anyhow::bail!(
+                        "nested orca-tui is disabled inside an Orca/Herdr terminal; \
+                         launch it from a separate system shell to avoid taking over PTYs"
+                    );
+                }
                 app.try_connect_daemon();
+                if !app.daemon_connected() && command_for_fallback.is_empty() {
+                    anyhow::bail!(
+                        "Orca daemon is unavailable and no standalone command was given — usage: orca-tui run --daemon -- <command>..."
+                    );
+                }
+                // When connected, the app is a pure Orca session viewer:
+                // hydrate_daemon_sessions() has already populated every live
+                // terminal and no command is auto-created. If no daemon was
+                // found, retain the historical standalone fallback for an
+                // explicitly supplied command.
+                if !app.daemon_connected() && !command_for_fallback.is_empty() {
+                    let fallback_specs =
+                        prepare_run_specs(command_for_fallback, remote.as_deref())?;
+                    app.spawn_specs(fallback_specs);
+                }
             }
 
             // Feature 8: mark every pane reconnect-eligible so a dropped remote
@@ -593,23 +671,89 @@ fn install_sigterm_handler(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) 
     }
 }
 
-/// Connect to a daemon and run a TUI client loop.
+/// The attach path predates `App::run`, so it has its own terminal lifecycle.
+/// Keep that lifecycle guarded: a failed draw, input read, or thread spawn must
+/// never leave the user's shell in raw mode or the alternate screen.
+struct AttachTerminalGuard {
+    active: bool,
+}
+
+impl AttachTerminalGuard {
+    fn enter() -> Result<Self> {
+        use crossterm::{
+            event::EnableMouseCapture,
+            execute,
+            terminal::{
+                disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+            },
+        };
+
+        enable_raw_mode().context("enabling raw mode")?;
+        let mut stdout = std::io::stdout();
+        // Set the flag before the fallible execute so the guard can clean up
+        // even if entering the alternate screen or enabling mouse capture
+        // fails halfway through.
+        let mut guard = Self { active: true };
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+            let _ = execute!(stdout, LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            guard.active = false;
+            return Err(error).context("entering alt screen + mouse");
+        }
+        Ok(guard)
+    }
+
+    fn restore<B: ratatui::backend::Backend>(
+        &mut self,
+        terminal: &mut ratatui::Terminal<B>,
+    ) -> Result<()> {
+        use crossterm::{
+            event::DisableMouseCapture,
+            execute,
+            terminal::{disable_raw_mode, LeaveAlternateScreen},
+        };
+
+        if !self.active {
+            return Ok(());
+        }
+        let mut stdout = std::io::stdout();
+        execute!(stdout, DisableMouseCapture, LeaveAlternateScreen)
+            .context("leaving alt screen + mouse")?;
+        disable_raw_mode().context("disabling raw mode")?;
+        terminal.show_cursor().context("showing cursor")?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for AttachTerminalGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        use crossterm::{
+            cursor::Show,
+            event::DisableMouseCapture,
+            execute,
+            terminal::{disable_raw_mode, LeaveAlternateScreen},
+        };
+        let mut stdout = std::io::stdout();
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen, Show);
+        let _ = disable_raw_mode();
+        self.active = false;
+    }
+}
+
+/// Connect to a daemon and run the legacy built-in-daemon TUI client loop.
 fn run_attach(socket_path: &Path) -> Result<()> {
     use crate::daemon_server::AttachClient;
-    use crate::layout::split_panes;
     use crate::pane::Pane;
     use crate::sidebar::{self, SidebarEntry};
+    use crate::tab_bar::{self, TabItem};
     use crate::workspace_view::{self, WorkspaceRow};
     use base64::{engine::general_purpose, Engine as _};
-    use crossterm::event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
-    };
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
     use crossterm::terminal::size as term_size;
-    use crossterm::{
-        execute,
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    };
     use ratatui::backend::CrosstermBackend;
     use ratatui::Terminal;
     use std::io::{BufRead, BufReader};
@@ -659,14 +803,13 @@ fn run_attach(socket_path: &Path) -> Result<()> {
         ));
     }
 
-    // Set up terminal.
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
+    // Set up terminal under an RAII guard. This guard remains active until the
+    // normal restore below succeeds, and also handles every early return.
+    let mut terminal_guard = AttachTerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let (cols, rows) = term_size().unwrap_or((80, 24));
+    let (mut cols, mut rows) = term_size().unwrap_or((80, 24));
     let mut panes: Vec<Pane> = sessions
         .iter()
         .map(|s| {
@@ -677,6 +820,11 @@ fn run_attach(socket_path: &Path) -> Result<()> {
         .collect();
 
     let mut focus: usize = 0;
+    let mut tab_hitboxes = crate::tab_bar::TabHitboxes::default();
+    let mut sidebar_hitboxes: Vec<Option<ratatui::layout::Rect>> = Vec::new();
+    let mut sidebar_rect: Option<ratatui::layout::Rect> = None;
+    let mut last_resize: Option<(usize, u16, u16)> = None;
+    let mut active_surface_size = (cols, rows);
     let mut workspace_open = false;
     let mut workspace_selected: usize = 0;
     let config = crate::config::Config::default();
@@ -686,6 +834,7 @@ fn run_attach(socket_path: &Path) -> Result<()> {
     let reader_stream = client.try_clone_stream()?;
     let (data_tx, data_rx) = mpsc::channel::<(usize, Vec<u8>)>(); // (session_id, bytes)
     let (exit_tx, exit_rx) = mpsc::channel::<(usize, Option<i32>)>(); // (session_id, code)
+    let (created_tx, created_rx) = mpsc::channel::<(usize, String)>();
     std::thread::Builder::new()
         .name("orcatui-attach-reader".into())
         .spawn(move || {
@@ -710,6 +859,11 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                                     let session = msg["session"].as_u64().unwrap_or(0) as usize;
                                     let code = msg["code"].as_i64().map(|c| c as i32);
                                     let _ = exit_tx.send((session, code));
+                                }
+                                Some("created") => {
+                                    let session = msg["id"].as_u64().unwrap_or(0) as usize;
+                                    let name = msg["name"].as_str().unwrap_or("bash").to_owned();
+                                    let _ = created_tx.send((session, name));
                                 }
                                 _ => {}
                             }
@@ -739,6 +893,12 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                     p.set_state(state);
                 }
             }
+            while let Ok((session_id, name)) = created_rx.try_recv() {
+                let mut pane = Pane::new(session_id, name, cols.max(20), rows.max(3));
+                pane.set_state(crate::agent::AgentState::Running);
+                panes.push(pane);
+                focus = panes.len().saturating_sub(1);
+            }
 
             // Derive the attach sidebar before the draw closure mutably
             // borrows panes. Daemon sessions are live panes; catalog rows are
@@ -767,6 +927,13 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                 entry.focused = true;
             }
             let configured_sidebar_width = config.layout.sidebar_width;
+            let tab_items: Vec<TabItem> = panes
+                .iter()
+                .map(|pane| TabItem {
+                    label: pane.name().to_owned(),
+                    status: None,
+                })
+                .collect();
 
             // Render.
             terminal.draw(|f| {
@@ -775,10 +942,10 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                     &sidebar_entries,
                     configured_sidebar_width,
                     total.width,
-                    22,
+                    12,
                 );
                 let show_sidebar =
-                    sidebar_width > 0 && total.width > sidebar_width.saturating_add(22);
+                    sidebar_width > 0 && total.width > sidebar_width.saturating_add(8);
                 let (sidebar_area, pane_area) = if show_sidebar {
                     let chunks = ratatui::layout::Layout::horizontal([
                         ratatui::layout::Constraint::Length(sidebar_width),
@@ -790,6 +957,10 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                 } else {
                     (None, total)
                 };
+                sidebar_rect = sidebar_area;
+                sidebar_hitboxes = sidebar_area
+                    .map(|area| sidebar::entry_hit_rects(area, &sidebar_entries, true))
+                    .unwrap_or_default();
                 if let Some(area) = sidebar_area {
                     sidebar::render_sidebar(
                         f,
@@ -799,10 +970,20 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                         Some(("● Daemon", theme.success())),
                     );
                 }
-                let rects = split_panes(pane_area, panes.len());
-                for (i, pane) in panes.iter_mut().enumerate() {
-                    let pane_area = rects.get(i).copied().unwrap_or_default();
-                    pane.render(f, pane_area, i == focus, theme);
+                let chrome = ratatui::layout::Layout::vertical([
+                    ratatui::layout::Constraint::Length(1),
+                    ratatui::layout::Constraint::Min(1),
+                ])
+                .split(pane_area);
+                tab_hitboxes = tab_bar::render_tab_bar(f, chrome[0], &tab_items, focus, theme);
+                if let Some(pane) = panes.get_mut(focus) {
+                    let inner_w = chrome[1].width.saturating_sub(2).max(20);
+                    let inner_h = chrome[1].height.saturating_sub(2).max(3);
+                    if pane.size() != (inner_w, inner_h) {
+                        pane.resize_viewport(inner_w, inner_h);
+                    }
+                    active_surface_size = (inner_w, inner_h);
+                    pane.render(f, chrome[1], true, theme);
                 }
                 if workspace_open {
                     workspace_view::render_workspace_overlay(
@@ -819,6 +1000,18 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                     );
                 }
             })?;
+
+            if let Some(pane) = panes.get(focus) {
+                let key = (pane.id(), active_surface_size.0, active_surface_size.1);
+                if last_resize != Some(key) {
+                    let _ = client.resize_session(
+                        pane.id(),
+                        active_surface_size.0,
+                        active_surface_size.1,
+                    );
+                    last_resize = Some(key);
+                }
+            }
 
             // Poll for input (10ms timeout — keeps the UI responsive to daemon output).
             if event::poll(std::time::Duration::from_millis(10))? {
@@ -868,6 +1061,15 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                                     focus = (focus + 1) % panes.len();
                                 }
                             }
+                            (KeyCode::BackTab, _) => {
+                                if !panes.is_empty() {
+                                    focus = if focus == 0 {
+                                        panes.len() - 1
+                                    } else {
+                                        focus - 1
+                                    };
+                                }
+                            }
                             (KeyCode::Enter, _) => {
                                 if let Some(p) = panes.get(focus) {
                                     let _ = client.write_session(p.id(), b"\r");
@@ -888,8 +1090,72 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                             _ => {}
                         }
                     }
+                } else if let Event::Resize(new_cols, new_rows) = ev {
+                    cols = new_cols.max(20);
+                    rows = new_rows.max(3);
+                    last_resize = None;
                 } else if let Event::Mouse(mouse) = ev {
                     match mouse.kind {
+                        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                            if tab_hitboxes.quit.is_some_and(|r| {
+                                mouse.column >= r.x
+                                    && mouse.column < r.right()
+                                    && mouse.row >= r.y
+                                    && mouse.row < r.bottom()
+                            }) {
+                                break;
+                            }
+                            if let Some(idx) = tab_hitboxes.tabs.iter().position(|r| {
+                                mouse.column >= r.x
+                                    && mouse.column < r.right()
+                                    && mouse.row >= r.y
+                                    && mouse.row < r.bottom()
+                            }) {
+                                if idx < panes.len() {
+                                    focus = idx;
+                                }
+                            } else if tab_hitboxes.add.is_some_and(|r| {
+                                mouse.column >= r.x
+                                    && mouse.column < r.right()
+                                    && mouse.row >= r.y
+                                    && mouse.row < r.bottom()
+                            }) {
+                                let command = vec!["bash".to_owned()];
+                                let _ = client.create_session("bash", &command, cols, rows);
+                            } else if sidebar_rect.is_some_and(|r| {
+                                mouse.column >= r.x
+                                    && mouse.column < r.right()
+                                    && mouse.row >= r.y
+                                    && mouse.row < r.bottom()
+                            }) {
+                                if let Some(idx) = sidebar_hitboxes.iter().position(|r| {
+                                    r.is_some_and(|rect| {
+                                        mouse.column >= rect.x
+                                            && mouse.column < rect.right()
+                                            && mouse.row >= rect.y
+                                            && mouse.row < rect.bottom()
+                                    })
+                                }) {
+                                    if idx < panes.len() {
+                                        focus = idx;
+                                    } else if let Some(workspace) =
+                                        workspace_catalog.get(idx.saturating_sub(panes.len()))
+                                    {
+                                        // The built-in daemon protocol does
+                                        // not carry workspace IDs. Match an
+                                        // attach session by its stable display
+                                        // name when possible; otherwise leave
+                                        // the catalog row read-only.
+                                        if let Some(pane_idx) = panes.iter().position(|pane| {
+                                            pane.name() == workspace.sidebar_name()
+                                                || pane.name() == workspace.display_name
+                                        }) {
+                                            focus = pane_idx;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         MouseEventKind::ScrollUp => {
                             if let Some(p) = panes.get_mut(focus) {
                                 p.scroll_up(3);
@@ -920,14 +1186,9 @@ fn run_attach(socket_path: &Path) -> Result<()> {
         Ok(())
     })();
 
-    // Restore terminal.
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-
+    // Restore terminal on the success path; the guard's Drop remains a
+    // panic/error fallback if any teardown operation itself fails.
+    terminal_guard.restore(&mut terminal)?;
     result
 }
 
@@ -1220,19 +1481,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_prs_and_issues_repo() {
-        let prs =
-            Cli::try_parse_from(["orcatui", "prs", "octocat/hello-world"]).expect("prs parses");
-        match prs.command.unwrap() {
-            Command::Prs { repo } => assert_eq!(repo, "octocat/hello-world"),
-            other => panic!("expected Prs, got {other:?}"),
-        }
-
-        let issues = Cli::try_parse_from(["orcatui", "issues", "octocat/hello-world"])
-            .expect("issues parses");
-        match issues.command.unwrap() {
-            Command::Issues { repo } => assert_eq!(repo, "octocat/hello-world"),
-            other => panic!("expected Issues, got {other:?}"),
+    fn removed_prs_and_issues_subcommands_are_rejected() {
+        for argv in [
+            ["orcatui", "prs", "octocat/hello-world"],
+            ["orcatui", "issues", "octocat/hello-world"],
+        ] {
+            let err = Cli::try_parse_from(argv).expect_err("legacy command is removed");
+            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
         }
     }
 
@@ -1311,10 +1566,10 @@ mod tests {
     }
 
     #[test]
-    fn prs_without_repo_is_a_required_arg_error() {
+    fn removed_prs_without_repo_is_an_invalid_subcommand_error() {
         let err =
-            Cli::try_parse_from(["orcatui", "prs"]).expect_err("prs requires the repo positional");
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+            Cli::try_parse_from(["orcatui", "prs"]).expect_err("legacy prs command is removed");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
     #[test]

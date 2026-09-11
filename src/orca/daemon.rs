@@ -9,9 +9,8 @@
 //!
 //! - **Transport**: Unix domain socket + token file (UUID).
 //! - **Two-socket model**: a `control` socket (NDJSON RPC) and a `stream`
-//!   socket (binary frames for PTY output). Both authenticate with a hello
-//!   handshake.
-//! - **Binary frame**: `[1B type] [4B BE u32 payload_len] [payload]`.
+//!   socket (NDJSON PTY events). Both authenticate with a hello handshake.
+//! - A legacy binary frame reader is retained for older fixtures/daemons.
 //! - **NDJSON**: newline-delimited JSON objects.
 //! - **Protocol version**: 36 (as of 2026-09).
 //!
@@ -175,6 +174,65 @@ pub struct DaemonResponse {
     pub error: Option<String>,
 }
 
+/// A live PTY session advertised by Orca's `listSessions` RPC.
+///
+/// The daemon adds fields over time, so the adapter intentionally keeps only
+/// the inventory fields needed to hydrate a TUI tab and defaults optional
+/// values for older daemon versions.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DaemonSessionInfo {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(rename = "shellState", default)]
+    pub shell_state: String,
+    #[serde(rename = "isAlive", default)]
+    pub is_alive: bool,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub cols: u16,
+    #[serde(default)]
+    pub rows: u16,
+    #[serde(default)]
+    pub pid: Option<i64>,
+    #[serde(rename = "terminalHandle", default)]
+    pub terminal_handle: Option<String>,
+    /// Structured Orca ownership metadata. Newer Orca sessions include the
+    /// launched agent here (for example `claim.agent = "codex"`); legacy
+    /// shell sessions leave the list empty.
+    #[serde(rename = "agentSessionOwners", default)]
+    pub agent_session_owners: Vec<DaemonAgentSessionOwner>,
+}
+
+/// Minimal projection of Orca's agent-session ownership record. The daemon
+/// adds fields over time, so only the nested agent identity is retained.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DaemonAgentSessionOwner {
+    #[serde(default)]
+    pub claim: Option<DaemonAgentSessionClaim>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DaemonAgentSessionClaim {
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// Snapshot returned by Orca's `createOrAttach`/`getSnapshot` RPC.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DaemonSnapshot {
+    #[serde(rename = "snapshotAnsi", default)]
+    pub snapshot_ansi: String,
+    #[serde(rename = "scrollbackAnsi", default)]
+    pub scrollback_ansi: String,
+    #[serde(rename = "rehydrateSequences", default)]
+    pub rehydrate_sequences: String,
+    #[serde(rename = "pendingEscapeTailAnsi", default)]
+    pub pending_escape_tail_ansi: String,
+}
+
 // ── Binary frame ───────────────────────────────────────────────────────────
 
 /// Binary frame types used on the stream socket.
@@ -223,6 +281,7 @@ pub struct Frame {
 
 /// Read exactly one binary frame from a reader. Returns `Err(DaemonError::Disconnected)`
 /// on EOF (clean disconnect) or partial frame (crash mid-send).
+#[allow(dead_code)]
 fn read_frame<R: Read>(reader: &mut R) -> Result<Frame, DaemonError> {
     let mut header = [0u8; FRAME_HEADER_SIZE];
     read_exact_or_disconnect(reader, &mut header)?;
@@ -375,7 +434,8 @@ impl DaemonEndpoint {
 // ── Daemon client ──────────────────────────────────────────────────────────
 
 /// A connected Orca daemon client. Owns a control socket (NDJSON RPC) and
-/// optionally a stream socket (binary frames for PTY data).
+/// optionally a stream socket (NDJSON PTY events, with legacy binary-frame
+/// compatibility in [`DaemonClient::read_stream_frame`]).
 pub struct DaemonClient {
     control: UnixStream,
     stream: Option<UnixStream>,
@@ -555,6 +615,25 @@ impl DaemonClient {
         self.rpc("listSessions", serde_json::json!({}))
     }
 
+    /// Attach this client to an existing session without creating a new PTY.
+    /// The returned payload contains the daemon's current ANSI snapshot.
+    pub fn attach_session(
+        &mut self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<serde_json::Value, DaemonError> {
+        self.rpc(
+            "createOrAttach",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cols": cols,
+                "rows": rows,
+                "attachOnly": true,
+            }),
+        )
+    }
+
     // ── Stream ────────────────────────────────────────────────────────
 
     /// Take the stream socket (moves it out — the caller owns it for blocking reads).
@@ -563,15 +642,62 @@ impl DaemonClient {
         self.stream.take()
     }
 
-    /// Read one frame from the stream socket. Blocks until a frame arrives or
-    /// the daemon disconnects.
+    /// Read one stream event from the socket. Orca v36 sends NDJSON lines;
+    /// older clients may still send the legacy binary frame format. Blocks
+    /// until one event arrives or the daemon disconnects.
     ///
     /// # Errors
     ///
     /// - [`DaemonError::Disconnected`] — daemon crashed, idle-shutdown, or EOF.
-    /// - [`DaemonError::Protocol`] — malformed frame header or unknown type.
+    /// - [`DaemonError::Protocol`] — malformed event/header or unknown type.
     pub fn read_stream_frame(stream: &mut UnixStream) -> Result<Frame, DaemonError> {
-        read_frame(stream)
+        // Orca's stream socket is newline-delimited JSON. Keep the legacy
+        // binary framing reader as a compatibility path for older fixtures.
+        let mut first = [0u8; 1];
+        read_exact_or_disconnect(stream, &mut first)?;
+        if first[0] == b'{' || first[0] == b'[' {
+            let mut payload = vec![first[0]];
+            loop {
+                let mut byte = [0u8; 1];
+                read_exact_or_disconnect(stream, &mut byte)?;
+                payload.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if payload.len() > FRAME_MAX_PAYLOAD {
+                    return Err(DaemonError::Protocol("stream NDJSON line too large".into()));
+                }
+            }
+            let json: serde_json::Value = serde_json::from_slice(&payload)
+                .map_err(|err| DaemonError::Protocol(format!("invalid stream event: {err}")))?;
+            let ftype = if json.get("event").and_then(|v| v.as_str()) == Some("data") {
+                FrameType::Data
+            } else {
+                FrameType::Event
+            };
+            return Ok(Frame { ftype, payload });
+        }
+
+        let mut header_tail = [0u8; FRAME_HEADER_SIZE - 1];
+        read_exact_or_disconnect(stream, &mut header_tail)?;
+        let mut header = [0u8; FRAME_HEADER_SIZE];
+        header[0] = first[0];
+        header[1..].copy_from_slice(&header_tail);
+        let type_byte = header[0];
+        let ftype = FrameType::from_byte(type_byte).ok_or_else(|| {
+            DaemonError::Protocol(format!("unknown frame type byte: {type_byte}"))
+        })?;
+        let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if payload_len > FRAME_MAX_PAYLOAD {
+            return Err(DaemonError::Protocol(format!(
+                "frame payload {payload_len} exceeds max {FRAME_MAX_PAYLOAD}"
+            )));
+        }
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            read_exact_or_disconnect(stream, &mut payload)?;
+        }
+        Ok(Frame { ftype, payload })
     }
 }
 
@@ -1021,6 +1147,28 @@ mod tests {
         assert_eq!(sessions["sessions"].as_array().unwrap().len(), 2);
     }
 
+    #[test]
+    fn daemon_session_info_deserializes_orca_inventory_fields() {
+        let info: DaemonSessionInfo = serde_json::from_value(serde_json::json!({
+            "sessionId": "session-a",
+            "state": "running",
+            "shellState": "ready",
+            "isAlive": true,
+            "cwd": "/tmp/worktree-a",
+            "cols": 120,
+            "rows": 40,
+            "pid": 1234,
+            "terminalHandle": "window-a"
+        }))
+        .expect("valid Orca session inventory");
+        assert_eq!(info.session_id, "session-a");
+        assert_eq!(info.state, "running");
+        assert!(info.is_alive);
+        assert_eq!(info.cols, 120);
+        assert_eq!(info.rows, 40);
+        assert_eq!(info.cwd.as_deref(), Some("/tmp/worktree-a"));
+    }
+
     // ── Stream + accessors ─────────────────────────────────────────────────
 
     #[test]
@@ -1043,6 +1191,16 @@ mod tests {
         let frame = DaemonClient::read_stream_frame(&mut client_sock).unwrap();
         assert_eq!(frame.ftype, FrameType::Event);
         assert_eq!(frame.payload, b"{\"event\":\"exit\"}");
+    }
+
+    #[test]
+    fn read_stream_frame_accepts_orca_ndjson_event() {
+        let (mut client_sock, mut server_sock) = UnixStream::pair().unwrap();
+        let line = b"{\"type\":\"event\",\"event\":\"data\",\"sessionId\":\"s1\",\"payload\":{\"data\":\"hello\"}}\n";
+        server_sock.write_all(line).unwrap();
+        let frame = DaemonClient::read_stream_frame(&mut client_sock).unwrap();
+        assert_eq!(frame.ftype, FrameType::Data);
+        assert_eq!(frame.payload, line);
     }
 
     #[test]

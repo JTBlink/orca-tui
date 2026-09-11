@@ -13,10 +13,25 @@ use crate::orca_daemon::{
 };
 
 /// 供 App 使用的 daemon 连接边界。
+enum DaemonCommand {
+    Write {
+        session_id: String,
+        data: Vec<u8>,
+    },
+    Resize {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    Kill {
+        session_id: String,
+    },
+}
+
 pub(crate) struct DaemonConnection {
     client: DaemonClient,
     options: DaemonConnectOptions,
-    write_tx: Option<Sender<(String, Vec<u8>)>>,
+    command_tx: Option<Sender<DaemonCommand>>,
 }
 
 impl DaemonConnection {
@@ -27,7 +42,7 @@ impl DaemonConnection {
             result.map(|client| Self {
                 client,
                 options: saved_options,
-                write_tx: None,
+                command_tx: None,
             })
         })
     }
@@ -35,6 +50,46 @@ impl DaemonConnection {
     /// 连接对应的 daemon 身份。
     pub(crate) fn identity(&self) -> &DaemonIdentity {
         self.client.identity()
+    }
+
+    /// Query every session currently owned by the Orca daemon.
+    pub(crate) fn list_sessions(
+        &mut self,
+    ) -> Result<Vec<crate::orca_daemon::DaemonSessionInfo>, DaemonError> {
+        let payload = self.client.list_sessions()?;
+        let sessions = payload
+            .get("sessions")
+            .cloned()
+            .ok_or_else(|| DaemonError::Protocol("listSessions missing sessions".into()))?;
+        serde_json::from_value(sessions)
+            .map_err(|err| DaemonError::Protocol(format!("invalid listSessions payload: {err}")))
+    }
+
+    /// Attach to an existing daemon session and return its current snapshot.
+    pub(crate) fn attach_session(
+        &mut self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<serde_json::Value, DaemonError> {
+        self.client.attach_session(session_id, cols, rows)
+    }
+
+    /// Read the daemon's best-effort foreground process name. This is used
+    /// only as a fallback label for legacy sessions that do not carry Orca's
+    /// structured `agentSessionOwners` metadata.
+    pub(crate) fn foreground_process(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Option<String>, DaemonError> {
+        let payload = self.client.rpc(
+            "getForegroundProcess",
+            serde_json::json!({ "sessionId": session_id }),
+        )?;
+        Ok(payload
+            .get("foregroundProcess")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned))
     }
 
     /// 获取控制端点（调试和诊断使用）。
@@ -45,31 +100,83 @@ impl DaemonConnection {
 
     /// 将输入排入专用 writer 线程，避免 UI loop 等待 daemon RPC 响应。
     pub(crate) fn enqueue_write(&mut self, session_id: String, data: Vec<u8>) {
-        if self.write_tx.is_none() {
-            let (tx, rx) = mpsc::channel::<(String, Vec<u8>)>();
+        self.ensure_command_tx();
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.send(DaemonCommand::Write { session_id, data });
+        }
+    }
+
+    /// 将 resize 排入专用 daemon RPC 线程，避免 render loop 阻塞。
+    pub(crate) fn enqueue_resize(&mut self, session_id: String, cols: u16, rows: u16) {
+        self.ensure_command_tx();
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.send(DaemonCommand::Resize {
+                session_id,
+                cols,
+                rows,
+            });
+        }
+    }
+
+    fn ensure_command_tx(&mut self) {
+        if self.command_tx.is_none() {
+            let (tx, rx) = mpsc::channel::<DaemonCommand>();
             let endpoint = self.client.endpoint().clone();
             let options = self.options.clone();
             thread::Builder::new()
-                .name("orca-daemon-writer".into())
+                .name("orca-daemon-rpc-writer".into())
                 .spawn(move || {
                     let Ok(mut writer) = DaemonClient::connect_with(endpoint, options) else {
                         return;
                     };
-                    while let Ok((session_id, data)) = rx.recv() {
-                        let _ = writer.rpc(
-                            "write",
-                            serde_json::json!({
-                                "sessionId": session_id,
-                                "data": String::from_utf8_lossy(&data),
-                            }),
-                        );
+                    while let Ok(command) = rx.recv() {
+                        match command {
+                            DaemonCommand::Write { session_id, data } => {
+                                let _ = writer.rpc(
+                                    "write",
+                                    serde_json::json!({
+                                        "sessionId": session_id,
+                                        "data": String::from_utf8_lossy(&data),
+                                    }),
+                                );
+                            }
+                            DaemonCommand::Resize {
+                                session_id,
+                                cols,
+                                rows,
+                            } => {
+                                let _ = writer.rpc(
+                                    "resize",
+                                    serde_json::json!({
+                                        "sessionId": session_id,
+                                        "cols": cols,
+                                        "rows": rows,
+                                    }),
+                                );
+                            }
+                            DaemonCommand::Kill { session_id } => {
+                                let _ = writer.rpc(
+                                    "kill",
+                                    serde_json::json!({
+                                        "sessionId": session_id,
+                                    }),
+                                );
+                            }
+                        }
                     }
                 })
                 .ok();
-            self.write_tx = Some(tx);
+            self.command_tx = Some(tx);
         }
-        if let Some(tx) = &self.write_tx {
-            let _ = tx.send((session_id, data));
+    }
+
+    /// Explicitly terminate a daemon-owned session. This is used only by the
+    /// pane close action (`x`); disconnecting the TUI or clicking the global
+    /// exit control never kills Orca sessions.
+    pub(crate) fn enqueue_kill(&mut self, session_id: String) {
+        self.ensure_command_tx();
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.send(DaemonCommand::Kill { session_id });
         }
     }
 

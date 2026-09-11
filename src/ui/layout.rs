@@ -1,10 +1,9 @@
 //! # Layout
 //!
-//! Screen splitting: arrange N agent panes in a row-major grid, reserving the
-//! last terminal line for a status/footer bar. Pure rect arithmetic over
-//! [`ratatui::layout::Rect`] — no state, so it recomputes cheaply every frame
-//! (the terminal-resize path and the per-pane viewport resize both key off
-//! these rects).
+//! Legacy grid arithmetic retained for compatibility and performance probes.
+//! The production TUI now uses [`crate::tab_bar`] and renders one active
+//! terminal surface; callers that still need a balanced grid can use this
+//! pure helper without affecting the tab layout.
 //!
 //! The grid is balanced: `cols = ceil(sqrt(n))`, `rows = ceil(n / cols)`, filled
 //! row-major so the final (partial) row sits at the bottom. Each cell gets a

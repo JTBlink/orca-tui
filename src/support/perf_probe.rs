@@ -14,6 +14,22 @@
 
 #![allow(clippy::cast_precision_loss, clippy::needless_pass_by_value)]
 
+#[cfg(test)]
+use crate::layout::split_panes;
+#[cfg(test)]
+use crate::pane::Pane;
+#[cfg(test)]
+use crate::scheduler::{FrameScheduler, TARGET_FRAME_60FPS};
+#[cfg(test)]
+use crate::terminal_emu::TerminalEmulator;
+#[cfg(test)]
+use ratatui::backend::TestBackend;
+#[cfg(test)]
+use ratatui::Terminal;
+#[cfg(test)]
+use std::hint::black_box;
+#[cfg(test)]
+use std::time::{Duration, Instant};
 
 /// Build ~`mb` megabytes of realistic agent-ish output: text lines, a color
 /// SGR flip every few chars, cursor moves and newlines.

@@ -15,6 +15,32 @@ use serde_json::Value;
 
 const INITIAL_LIMIT: usize = 10_000;
 
+/// Orca's user-facing live terminal projection.
+///
+/// The daemon `listSessions` RPC intentionally exposes PTY state only.  The
+/// desktop CLI adds the title/agent identity and visual ordering that users
+/// actually see, so the TUI keeps this small projection to reconcile its
+/// attached sessions with Orca's presentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrcaTerminal {
+    /// Stable daemon PTY/session id used to join this row to `listSessions`.
+    pub pty_id: String,
+    /// Runtime-issued terminal handle (diagnostic identity).
+    pub handle: String,
+    /// Orca's tab title, when one is set.
+    pub title: Option<String>,
+    /// Structured agent identity, when Orca recognized the foreground agent.
+    pub agent_identity: Option<String>,
+    /// Stable Orca workspace identity owning this terminal.
+    pub worktree_id: Option<String>,
+    /// Workspace checkout path, when exposed by Orca.
+    pub worktree_path: Option<PathBuf>,
+    /// Orca's branch projection for the terminal's workspace.
+    pub branch: Option<String>,
+    /// Position in Orca's terminal list (the desktop presentation order).
+    pub order: usize,
+}
+
 /// Host coverage reported by Orca for one listing page.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CatalogScope {
@@ -154,6 +180,116 @@ impl OrcaWorkspace {
                 .map(|host| host == "local")
                 .unwrap_or(true)
     }
+}
+
+/// Read Orca's current user-facing terminal inventory.
+///
+/// This is deliberately separate from daemon session discovery: the daemon is
+/// authoritative for PTY bytes and input, while the Orca runtime is
+/// authoritative for titles, agent identity, and display order.
+pub fn list_terminals() -> Result<Vec<OrcaTerminal>> {
+    let executable = std::env::var_os("ORCA_CLI").unwrap_or_else(|| "orca".into());
+    list_terminals_with_executable(&executable)
+}
+
+fn list_terminals_with_executable(executable: &OsStr) -> Result<Vec<OrcaTerminal>> {
+    let limit = INITIAL_LIMIT.to_string();
+    let output = Command::new(executable)
+        .args(["terminal", "list", "--json", "--limit", &limit])
+        .args(["--include-visual-layouts"])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run {} terminal list",
+                executable.to_string_lossy()
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        bail!(
+            "{} terminal list failed{}",
+            executable.to_string_lossy(),
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        );
+    }
+    parse_terminals(&output.stdout)
+}
+
+/// Parse the `orca terminal list --json` envelope.
+pub fn parse_terminals(bytes: &[u8]) -> Result<Vec<OrcaTerminal>> {
+    let root: Value = serde_json::from_slice(bytes).context("parsing Orca terminal JSON")?;
+    if root.get("ok").and_then(Value::as_bool) == Some(false) {
+        let message = root
+            .get("error")
+            .and_then(|error| error.get("message").or(Some(error)))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown Orca error");
+        bail!("Orca terminal catalog rejected: {message}");
+    }
+    let layout_titles = visual_layout_titles(root.get("result"));
+    let rows = root
+        .get("result")
+        .and_then(|result| result.get("terminals"))
+        .and_then(Value::as_array)
+        .context("Orca terminal response has no terminals array")?;
+    rows.iter()
+        .enumerate()
+        .map(|(order, row)| {
+            let handle = required_string(row, "handle")?;
+            let title =
+                optional_string(row, "title").or_else(|| layout_titles.get(&handle).cloned());
+            Ok(OrcaTerminal {
+                pty_id: required_string(row, "ptyId")?,
+                handle,
+                title,
+                agent_identity: optional_string(row, "agentIdentity"),
+                worktree_id: optional_string(row, "worktreeId"),
+                worktree_path: optional_string(row, "worktreePath").map(PathBuf::from),
+                branch: optional_string(row, "branch").map(|branch| normalize_branch(&branch)),
+                order,
+            })
+        })
+        .collect()
+}
+
+/// Extract tab/pane titles from the optional visual layout projection. Some
+/// Orca sessions intentionally keep `terminals[*].title` null while the UI
+/// title lives on the containing tab, so the latter is the correct fallback.
+fn visual_layout_titles(result: Option<&Value>) -> std::collections::HashMap<String, String> {
+    let mut titles = std::collections::HashMap::new();
+    let Some(layouts) = result
+        .and_then(|result| result.get("visualLayouts"))
+        .and_then(Value::as_array)
+    else {
+        return titles;
+    };
+    for layout in layouts {
+        let Some(tabs) = layout
+            .get("root")
+            .and_then(|root| root.get("tabs"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for tab in tabs {
+            let tab_title = optional_string(tab, "title");
+            let Some(panes) = tab.get("panes") else {
+                continue;
+            };
+            let Some(handle) = optional_string(panes, "handle") else {
+                continue;
+            };
+            let title = optional_string(panes, "title").or_else(|| tab_title.clone());
+            if let Some(title) = title {
+                titles.insert(handle, title);
+            }
+        }
+    }
+    titles
 }
 
 /// Query Orca's complete workspace catalog.
@@ -639,7 +775,7 @@ esac
 
     #[test]
     fn parse_catalog_reads_all_workspace_metadata() {
-        let json = br#"{
+        let json = r#"{
           "ok": true,
           "result": {
             "totalCount": 2,
@@ -667,7 +803,8 @@ esac
               }
             ]
           }
-        }"#;
+        }"#
+        .as_bytes();
         let (rows, total, truncated) = parse_catalog(json).expect("parse catalog");
         assert_eq!(rows.len(), 2);
         assert_eq!(total, Some(2));
@@ -678,6 +815,39 @@ esac
         assert_eq!(rows[1].branch, "feature/login");
         assert_eq!(rows[1].host_id.as_deref(), Some("ssh-host"));
         assert!(!rows[1].is_archived);
+    }
+
+    #[test]
+    fn parse_terminals_keeps_orca_title_agent_and_order() {
+        let json = r#"{
+          "ok": true,
+          "result": {
+            "terminals": [
+              {
+                "handle": "term-a",
+                "ptyId": "repo::/work@@a",
+                "title": "修复输入焦点 | project",
+                "agentIdentity": "codex"
+              },
+              {
+                "handle": "term-b",
+                "ptyId": "repo::/work@@b",
+                "title": null
+              }
+            ]
+          }
+        }"#
+        .as_bytes();
+
+        let rows = parse_terminals(json).expect("parse terminal catalog");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].pty_id, "repo::/work@@a");
+        assert_eq!(rows[0].title.as_deref(), Some("修复输入焦点 | project"));
+        assert_eq!(rows[0].agent_identity.as_deref(), Some("codex"));
+        assert_eq!(rows[0].order, 0);
+        assert_eq!(rows[1].title, None);
+        assert_eq!(rows[1].order, 1);
     }
 
     #[test]
