@@ -580,12 +580,13 @@ fn install_sigterm_handler(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) 
     static mut SHUTDOWN_FLAG: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
     unsafe {
         SHUTDOWN_FLAG = Some(flag);
-        let handler = sigterm_handler as usize;
+        let handler = sigterm_handler as *const () as usize;
         signal(15, handler); // SIGTERM = 15
     }
     extern "C" fn sigterm_handler(_sig: i32) {
         unsafe {
-            if let Some(flag) = &SHUTDOWN_FLAG {
+            let ptr = &raw const SHUTDOWN_FLAG;
+            if let Some(flag) = &*ptr {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }

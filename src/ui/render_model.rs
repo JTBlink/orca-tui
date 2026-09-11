@@ -24,6 +24,7 @@ pub(crate) struct RenderModel {
 /// pane/sidebar model means the draw closure consumes one immutable snapshot
 /// instead of borrowing transient fields from `App` piecemeal.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub(crate) struct OverlayModel {
     pub(crate) mode: InputMode,
     pub(crate) jump_query: String,
@@ -53,6 +54,7 @@ pub(crate) struct OverlayModel {
 impl RenderModel {
     /// 从当前 slot 集合生成渲染模型。
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn from_slots(slots: &[PaneSlot], focus: usize) -> Self {
         Self::from_slots_with_catalog(slots, focus, &[])
     }

@@ -17,6 +17,7 @@
 
 /// Build ~`mb` megabytes of realistic agent-ish output: text lines, a color
 /// SGR flip every few chars, cursor moves and newlines.
+#[allow(dead_code)]
 fn synth_ansi(mb: usize) -> Vec<u8> {
     let target = mb * 1024 * 1024;
     let mut out = Vec::with_capacity(target);

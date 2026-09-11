@@ -198,6 +198,7 @@ impl FrameType {
 }
 
 /// Encode a binary frame.
+#[allow(dead_code)]
 fn encode_frame(ftype: FrameType, payload: &[u8]) -> Result<Vec<u8>> {
     if payload.len() > FRAME_MAX_PAYLOAD {
         return Err(anyhow!(
@@ -379,6 +380,7 @@ pub struct DaemonClient {
     control: UnixStream,
     stream: Option<UnixStream>,
     endpoint: DaemonEndpoint,
+    #[allow(dead_code)]
     client_id: String,
     identity: DaemonIdentity,
     /// RPC request ID counter.

@@ -187,6 +187,7 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// [`PtySession`] `Drop` kills + joins the child processes) — otherwise
     /// removing a directory that is still a live process's cwd would fail.
     /// `None` when not in worktree-isolation mode.
+    #[allow(dead_code)]
     worktrees: Option<OwnedWorktrees>,
     /// Complete Orca workspace catalog rows that do not have a local pane.
     /// Local rows are represented by their running pane and are filtered out
@@ -3357,6 +3358,7 @@ impl<B: Backend> App<B> {
         };
     }
 
+    #[allow(dead_code)]
     fn focus_next(&mut self) {
         if self.panes.is_empty() {
             return;
@@ -3368,6 +3370,7 @@ impl<B: Backend> App<B> {
         }
     }
 
+    #[allow(dead_code)]
     fn focus_prev(&mut self) {
         if self.panes.is_empty() {
             return;

@@ -178,6 +178,7 @@ pub struct DaemonServer {
     next_session_id: usize,
     /// Connected client writers (id → shared stream).
     clients: HashMap<usize, Arc<Mutex<UnixStream>>>,
+    #[allow(dead_code)]
     next_client_id: usize,
     event_rx: mpsc::Receiver<DaemonEvent>,
     event_tx: mpsc::Sender<DaemonEvent>,
@@ -506,6 +507,7 @@ impl DaemonServer {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
+    #[allow(dead_code)]
     fn all_sessions_gone(&self) -> bool {
         self.sessions.iter().all(|e| e.session.is_none())
     }
