@@ -27,10 +27,10 @@
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 /// Current Orca daemon protocol version (must match the running daemon).

@@ -1400,7 +1400,7 @@ impl<B: Backend> App<B> {
                                             }
                                         }
                                     }
-                                    Err(DaemonError::Disconnected { reason }) => {
+                                    Err(DaemonError::Disconnected { reason: _ }) => {
                                         // Signal all panes as exited.
                                         let ids: Vec<usize> = {
                                             let m = map.lock().unwrap();

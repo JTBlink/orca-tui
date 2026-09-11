@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::Widget;
 use ratatui::Frame;
 
 use crate::config::ThemeConfig;
