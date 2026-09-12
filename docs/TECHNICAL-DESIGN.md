@@ -6,7 +6,8 @@
 ## 目标与运行路径
 
 `orcatui` 在一个 ratatui 界面中运行和观察多个命令行 Agent。独立模式下每个 Agent 有本机
-PTY；Orca daemon 模式下每个 tab 对应 daemon 已持有的共享 PTY session。当前窗口只绘制活动
+PTY；Orca GUI 模式下已有 tab 通过公开 CLI 以文本屏幕镜像呈现，TUI 自己创建的 tab 由 Orca runtime
+持有。当前窗口只绘制活动
 tab 的一个真实终端表面，切换 tab 不会销毁或重建后台会话。`App` 负责输入路由、生命周期、
 布局、状态聚合和可选编排。
 
@@ -17,12 +18,12 @@ tab 的一个真实终端表面，切换 tab 不会销毁或重建后台会话�
 
 内置 daemon：Agent <-> DaemonServer <-> Unix socket <-> AttachClient <-> TUI
 
-Orca daemon：Orca daemon（共享 PTY sessions）
-             --control/stream sockets--> DaemonClient <-> App <-> Pane <-> ratatui
+Orca GUI：orca terminal list/read（CLI 子进程） -> App -> Pane -> ratatui
+         TUI-owned input/create/close -> orca terminal send/create/close
 ```
 
-内置 daemon 和 Orca GUI daemon 不是同一个服务，协议不能混用。代码分别位于
-`src/adapters/daemon_server.rs` 和 `src/orca/daemon.rs`。
+内置 daemon 和 Orca GUI runtime 不是同一个服务，协议不能混用。内置 daemon 代码位于
+`src/adapters/daemon_server.rs`，Orca 私有协议模型保留在 `src/orca/daemon.rs`，但 GUI 集成不再使用它。
 
 ## 源码目录
 
@@ -54,6 +55,7 @@ Orca daemon：Orca daemon（共享 PTY sessions）
 | `scheduler.rs` / `layout.rs` / `sidebar.rs` / `tab_bar.rs` | 刷新调度、兼容网格算法、侧边栏和终端 tabs |
 | `daemon_server.rs` | 内置 daemon、attach 协议和会话持有 |
 | `orca_daemon.rs` | Orca GUI daemon v36 客户端 |
+| `cli_bridge.rs` | Orca 公共 `terminal` CLI 的 list/read/send/create/close 适配 |
 | `orca_workspaces.rs` | Orca CLI 全局 workspace catalog 读取、完整性校验和降级 |
 | `workspace_view.rs` | 完整 workspace inventory overlay 与窗口化滚动 |
 | `worktree.rs` | Git worktree 创建、分支和生命周期清理 |
@@ -96,26 +98,25 @@ daemon 持有 PTY，attach 客户端断开不影响 Agent。默认 socket 是
 `$XDG_RUNTIME_DIR/orcatui.sock`，否则为 `/tmp/orcatui.sock`。该实现目前应视为单用户本机
 服务：socket 权限和客户端认证需要在引入多用户部署前补齐。
 
-## Orca GUI daemon v36
+## Orca GUI 公共 CLI 集成
 
-`orca_daemon::PROTOCOL_VERSION` 当前为 `36`。客户端连接两个 Unix socket：control 和 stream
-均使用逐行 NDJSON；stream 每行是带 `sessionId` 的 `event=data`、`event=exit` 等事件，PTY
-内容位于 `payload.data`。客户端仍保留旧二进制帧兼容读取路径。两个 socket 都要发送
-带 token、`clientId` 和 role 的 hello；control 与 stream 的 `daemonIdentity` 必须对应同一
-daemon 实例。发现逻辑查找 Orca 的 versioned `daemon-v36.sock` / token，并兼容旧布局。
+`run --daemon` 不再连接 Orca 的私有 Unix socket，也不使用 `createOrAttach`、stream reader、
+`write`、`resize` 或 `kill`。`cli_bridge.rs` 通过 argv 调用以下公开能力：
 
-连接完成后先调用 `listSessions`，过滤 `isAlive=false` 的记录；已有 live session 使用只读
-`getSnapshot`，把 `scrollbackAnsi + rehydrateSequences + snapshotAnsi` 注入对应 tab 的终端
-模拟器。不能把 `createOrAttach(attachOnly=true)` 当成只读操作：Orca v36 会先
-`detachAllClients()`，再把调用方设为新的 attachment，从而抢走 GUI 输入。已有会话在 TUI 中
-因此不发送输入或 resize；只有 tab 栏 `+`、`n` 或自定义命令入口显式创建的新会话才触发
-`createOrAttach`，并由 TUI 持有其 attachment。关闭已有 tab/窗口时只发送独立的 `kill` RPC，
-不改变 attachment ownership。随后将新会话的 stream 事件按 session ID 路由，PTY 生命周期始终由
-Orca daemon 管理。由于 daemon `listSessions` 只提供 PTY 状态，启动/重连时另行读取
-`orca terminal list --include-visual-layouts --json`，按稳定 `ptyId` 合并 Orca 的标题、
-`agentIdentity` 和视觉顺序；匹配不到的 live session 仍保留，但使用 daemon 的安全回退标签，
-并写入脱敏诊断计数。只读快照只限制输入、resize 和 attachment ownership；关闭 tab 或退出
-TUI 时，会对当前展示的 Orca session 发送 `kill`，让 Orca GUI 同步移除对应终端 tab。
+- `orca terminal list --json --include-visual-layouts`：发现 handle、ptyId、标题、工作区和顺序；
+- `orca terminal read --terminal <handle> --screen --json`：读取文本屏幕镜像；
+- `orca terminal send --terminal <handle> ... --json`：仅发送到 TUI 明确创建的会话；
+- `orca terminal create/close --json`：创建和关闭 TUI-owned tab。
+
+后台 poller 每 500ms 刷新 list/read，结果经 `AgentBus` 进入 UI。已有 Orca tab 标记为
+`SessionOwner::OrcaExisting`，只读展示；关闭 TUI 或点击其 `×` 只移除本地视图，不改变 Orca
+会话。`+`/`n` 创建的 tab 标记为 `OrcaTuiOwned`，输入走 `terminal send`，退出时才调用
+`terminal close --tab`。这条 ownership seam 保证 TUI 独占自己的 raw mode，而不会取得或释放
+Orca GUI 的输入 attachment。
+
+`read --screen` 是文本投影，不包含完整 ANSI/alternate-screen 状态；因此 GUI-owned pane
+可能丢失部分颜色和终端交互语义，这是避免输入冲突的明确取舍。若未来 Orca 提供公开的
+serialized snapshot/stream API，可在 `OrcaCliBridge` 内替换实现而不改变 App 接口。
 
 维护协议适配时，必须同时核对 `src/orca/daemon.rs` 与同级 `../orca/src/main/daemon/` 中的
 client、stream reader、request router 和测试。不要仅依据旧文档中的字段名或帧格式。
@@ -126,7 +127,8 @@ client、stream reader、request router 和测试。不要仅依据旧文档中�
 完整 argv；空段丢弃。Normal 模式把输入转发给焦点 Agent，`Ctrl+Alt+P` 进入 Pane 模式，
 `Ctrl+Q` 为全局退出键。
 
-`App` 通过 `PaneSlot` 聚合单个窗格的终端状态、启动命令、编排任务、daemon session、重连、
+`App` 通过 `PaneSlot` 聚合单个窗格的终端状态、启动命令、编排任务、daemon session、Orca
+runtime handle、会话归属、重连、
 pin 和活动状态。Vec position 只承担布局与焦点索引；异步输出始终先用稳定 pane id 反查当前
 位置，不能把稳定 id 当作当前 Vec 下标。未知 daemon session id 应丢弃，不能默认注入第一个
 窗格。
@@ -142,11 +144,11 @@ reconnect、pin 或 status 的平行状态字段。新增字段必须先归入 `
 渲染边界由 `render_model::RenderModel` 负责从 slot 派生 sidebar entries、状态 tally，并生成
 一次性的 `OverlayModel`（Jump、Spawn、Tasks、Settings、Activity、Dashboard、完整 Workspaces
 清单等 modal 的只读视图数据），再交给 ratatui 绘制。`w` 打开可滚动的全量 workspace inventory，
-所以 sidebar 的视口窗口化不会静默丢失前面的 workspace。daemon 控制面由
-`daemon_connection::DaemonConnection` 包装，输入写入
-通过专用 writer 线程排队，避免 UI loop 等待 RPC。
-动态 session 创建同样通过短生命周期 worker connection 执行；占位 pane 在结果返回前保持
-Idle，成功后再注入 snapshot 并注册稳定 session id，失败则转为 Failed/toast。
+所以 sidebar 的视口窗口化不会静默丢失前面的 workspace。内置 daemon 控制面由
+`daemon_connection::DaemonConnection` 包装；GUI runtime 控制面由 `orca_cli_bridge::OrcaCliBridge`
+包装，输入写入通过专用 worker 线程排队，避免 UI loop 等待外部进程。
+动态 Orca session 创建同样通过 worker 执行；占位 pane 在结果返回前保持 Idle，成功后记录
+runtime handle 并注入 screen projection，失败则转为 Failed/toast。
 
 ## 配置与外部集成
 
@@ -203,7 +205,8 @@ tab 的单个终端 surface：
 
 tab 只是视图选择器；所有 tab 复用同一个 TUI 终端 surface，后端会话由 `PaneSlot` 持续消费，
 切回时直接显示最新状态。横向 tab 只投影当前焦点工作区的终端；鼠标点击 tab、`+` 或左侧
-workspace 均可导航，点击 tab 右侧 `×` 可关闭当前 TUI tab 并发送对应 Orca session 的 `kill`；
-退出 TUI 窗口也会清理当前展示的 Orca sessions。普通模式下 `Tab` / `Shift+Tab` 也只在该工作区内循环切换 tab。这样终端
+workspace 均可导航，点击 tab 右侧 `×` 可关闭当前 TUI tab；只有 `SessionOwner::OrcaTuiOwned`
+才调用 `terminal close --tab`。退出 TUI 窗口不会清理 Orca-existing sessions。普通模式下 `Tab` /
+`Shift+Tab` 也只在该工作区内循环切换 tab。这样终端
 尺寸按整个内容区同步给活动 PTY，不再按 split pane
 网格缩小，fullscreen TUI 与真实当前终端的行为保持一致。

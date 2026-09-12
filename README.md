@@ -1,11 +1,11 @@
 # orca-tui
 
 `orca-tui` 是一个终端多 Agent 编排工具。独立模式下它为 Claude Code、Codex、OpenCode、Gemini CLI
-等命令行 Agent 创建本机 PTY；连接 Orca GUI daemon 时则复用 daemon 已打开的共享 PTY 会话。两种模式
+等命令行 Agent 创建本机 PTY；连接 Orca GUI 时则通过公开的 `orca terminal` CLI 查看和操作终端。两种模式
 都以 Herdr 风格的 workspace/sidebar + terminal tabs 展示和管理：左侧先选工作区，横向 tab 只显示
 当前工作区的终端，所有 tabs 共享当前窗口的一个真实终端表面。
 
-项目支持直接管理本机 PTY、连接内置 daemon，以及连接 Orca GUI daemon。当前 crate 版本为
+项目支持直接管理本机 PTY、连接内置 daemon，以及通过公共 CLI 连接 Orca GUI。当前 crate 版本为
 `0.5.0`。
 
 推送形如 `v0.5.0` 的 Git 标签会触发 GitHub Actions 自动验证、构建并发布 Linux（x86_64、
@@ -16,12 +16,12 @@ Actions 页面手动运行 `Release packages`，指定一个已有标签重新�
 
 - 多 Agent 终端 tabs 和完整终端输出渲染
 - Normal 模式输入直通当前 Agent，Tab/Shift+Tab 快速切换终端
-- 可选的独立 Git worktree；daemon 模式复用 Orca 已有 workspace
+- 可选的独立 Git worktree；Orca CLI 模式复用 Orca 已有 workspace
 - SSH 远程执行、断线重连、运行时新增 Agent
 - Activity 时间线、Tasks 任务浏览、Settings 设置和状态看板
 - GitHub issue / PR 集成（通过 `gh`）
 - 内置 daemon 持久会话和多客户端 attach
-- Orca GUI daemon v36 客户端
+- Orca GUI 公共 CLI 集成（不打开 daemon 私有 socket）
 - 移动端 WebSocket 状态服务
 - 可选的 `orca-tui-inject` 终端录制 / 回放调试工具
 
@@ -62,9 +62,9 @@ orca-tui
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
-直接启动时，如果检测到 Orca GUI daemon，TUI 会进入展示/attach 模式，为 Orca 当前所有
+直接启动时，如果检测到 Orca GUI runtime，TUI 会进入展示模式，为 Orca 当前所有
 live terminal 建立对应 tab，不会创建新的 Agent；使用 tab 栏 `+` 或 Pane 模式 `n` 才会
-显式创建。没有 Orca daemon 时，TUI 才回退到读取全局 workspace catalog，并为每个可访问的
+显式创建。没有 Orca runtime 时，TUI 才回退到读取全局 workspace catalog，并为每个可访问的
 local checkout 建立一个 tab；Agent 会在对应 checkout 中运行。远程或不可访问的 workspace
 也会保留在侧边栏中。也可以显式使用
 `--all-worktrees`：
@@ -102,7 +102,7 @@ orca-tui run --cwd ./my-repo --worktree -- claude :: codex
 |---|---|:---:|---|
 | 独立模式 | `orca-tui run -- claude` | 否 | 当前进程直接创建和管理 PTY |
 | 内置 daemon | `orca-tui daemon -- claude` + `orca-tui attach` | 是 | daemon 持有 PTY，可多客户端连接 |
-| Orca GUI daemon | `orca-tui run --daemon` | 是 | 启动时只读展示 daemon 已打开的终端；通过 `+`/`n` 显式创建由 TUI 拥有的新 tab |
+| Orca GUI runtime | `orca-tui run --daemon` | 是 | 通过 `orca terminal list/read` 只读镜像已有终端；通过 `+`/`n` 使用 `terminal create` 创建由 TUI 拥有的新 tab |
 
 ### 内置 daemon
 
@@ -117,24 +117,25 @@ orca-tui attach
 默认 socket 为 `$XDG_RUNTIME_DIR/orcatui.sock`；未设置时为 `/tmp/orcatui.sock`。两端都可以
 通过 `--socket PATH` 指定路径。attach 中按 `Ctrl+Q` 只断开客户端，不会终止 daemon 中的 Agent。
 
-### Orca GUI daemon
+### Orca GUI runtime
 
 ```bash
 orca-tui run --daemon
 ```
 
-客户端会自动查找 Orca daemon v36 的 socket 和 token。连接成功后会调用 `listSessions`，为每个
-仍在运行的 Orca 窗体建立一个只读 tab，并通过 `getSnapshot` 拉取当前快照；不会调用
-`createOrAttach(attachOnly)`，因此不会替换 Orca GUI 的输入 attachment。已存在的 Orca tab
-在 TUI 中不能输入或 resize；点击 tab 右侧的 `×` 会同步终止对应的 Orca 会话并关闭 Orca
-中的终端 tab。使用 tab 栏的 `+`/`n` 显式创建的新 tab 仍由 TUI 拥有并可交互。退出 TUI
-窗口也会同步终止当前展示的 Orca 会话；只读只表示不抢占输入 attachment，不表示关闭时保留会话。
-同时调用 `orca terminal list --include-visual-layouts --json`，按 `ptyId` 对齐 Orca 实际显示的
-标题、Agent 身份和 tab 顺序；这样 TUI 不会再用 cwd 或 bash/zsh 猜测 Agent 名称。切换 tab 不会
-创建新的 PTY。daemon 模式启动时是只读展示客户端，不会因为命令行参数自动创建 agent；使用 tab 栏的
+建议从 macOS Terminal、系统 shell 或其他独立终端启动；在 Orca/Herdr 管理的终端内嵌套启动会被安全拒绝，
+避免把当前 Orca tab 误当作 TUI 自己的宿主。
+
+客户端只调用公开命令 `orca terminal list --json --include-visual-layouts`、`terminal read --screen`
+和（仅对 TUI 创建的会话）`terminal send`/`terminal close --tab`。已有 Orca tab 是只读镜像，
+不会 attach、write、resize 或 kill，因此不会抢占 Orca GUI 的输入；点击其 `×` 只移除 TUI
+视图。使用 tab 栏的 `+`/`n` 显式创建的新 tab 才由 TUI 拥有并可交互，退出 TUI 也只关闭这些
+自有 tab。轮询线程每 500ms 刷新清单和屏幕，GUI 关闭终端后 TUI 会自动移除对应视图。
+同时按 `ptyId` 对齐 Orca 实际显示的标题、Agent 身份和 tab 顺序；这样 TUI 不会再用 cwd 或
+bash/zsh 猜测 Agent 名称。切换 tab 不会创建新的 PTY。daemon 模式启动时是只读展示客户端，不会因为命令行参数自动创建 agent；使用 tab 栏的
 `+` 或 Pane 模式的 `n` 才会显式创建新终端。底部 `Ctrl+Q 退出` 旁的 `× 退出` 也支持鼠标点击。
-找不到 daemon 或握手失败时，若提供了显式命令则回退为独立模式运行；运行中断线会按 `[daemon]`
-配置尝试重连。内置 daemon 与 Orca GUI daemon 使用不同协议，不能混用。详见[技术设计](docs/TECHNICAL-DESIGN.md)。
+找不到 Orca CLI 或命令失败时，若提供了显式命令则回退为独立模式运行。内置 daemon/attach
+仍保留给 `orca-tui daemon` 子命令使用；GUI 集成不再依赖其私有协议。详见[技术设计](docs/TECHNICAL-DESIGN.md)。
 
 ## 远程与移动状态
 
@@ -159,10 +160,10 @@ token；当前仓库只提供服务端，不包含移动端页面。
 | 按键 | 作用 |
 |---|---|
 | `Ctrl+Alt+P` | 进入终端控制模式 |
-| `Ctrl+Q` / tab 栏 `× 退出` | 退出 TUI；Orca daemon 模式同步关闭当前展示的 Orca 会话，内置 attach 模式只断开客户端 |
+| `Ctrl+Q` / tab 栏 `× 退出` | 退出 TUI；Orca 已有会话保持不变，仅关闭 TUI 自己创建的 tab；内置 attach 模式只断开客户端 |
 | 鼠标滚轮 | 滚动当前终端历史输出 |
 | 鼠标点击 tab/workspace | 切换活动终端；横向 tab 仅属于当前工作区 |
-| 点击 tab 右侧 `×` | 关闭当前 TUI tab，并同步关闭对应的 Orca 会话/tab |
+| 点击 tab 右侧 `×` | 关闭当前 TUI tab；只有 TUI 创建的 Orca tab 才会调用 `terminal close --tab` |
 | 鼠标拖选 | 复制文本到系统剪贴板 |
 
 终端控制模式：

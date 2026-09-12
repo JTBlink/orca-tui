@@ -10,7 +10,7 @@
 //!
 //! ```text
 //!   local session:  std::thread (portable-pty reader)  ──▶  std::mpsc
-//!   daemon stream: std::thread (NDJSON reader)         ──▶  tokio mpsc (AgentBus)
+//!   Orca CLI poller: std::thread (list/read workers)   ──▶  tokio mpsc (AgentBus)
 //!   main thread:  App::run  ──try_recv──▶  AgentBus receiver  ──▶  Pane.feed
 //! ```
 //!
@@ -51,9 +51,10 @@ use crate::daemon_connection::DaemonConnection;
 use crate::input::{self, FocusDirection as FocusDir, InputCommand, InputMode, InteractionState};
 use crate::integrations::RepoRef;
 use crate::mobile::AgentSnapshot;
+use crate::orca_cli_bridge::{CreatedTerminal, OrcaCliBridge};
 use crate::orca_workspaces::{OrcaTerminal, OrcaWorkspace};
 use crate::pane::Pane;
-use crate::pane_slot::PaneSlot;
+use crate::pane_slot::{PaneSlot, SessionOwner};
 use crate::pty_session::PtySession;
 use crate::render_model::RenderModel;
 use crate::scheduler::{FrameScheduler, TARGET_FRAME_60FPS};
@@ -72,7 +73,7 @@ pub enum ConnectionState {
     /// No daemon — orcatui manages PTYs directly (the default/legacy mode).
     #[default]
     Standalone,
-    /// Connected to a daemon — panes are backed by daemon sessions.
+    /// Connected to an Orca runtime or the legacy built-in daemon.
     Connected,
     /// Was connected, but the daemon disconnected (crash, idle shutdown).
     /// `reason` is the error message; `next_retry` is when to attempt reconnection.
@@ -214,9 +215,8 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     /// workspace rows are shown, while the overlay discloses that completeness
     /// cannot be proven for that source.
     workspace_unverifiable_scope_hosts: Vec<String>,
-    /// Orca's user-facing terminal projection, joined to daemon sessions by
-    /// `ptyId`. This supplies titles/agent identities that `listSessions`
-    /// intentionally does not expose.
+    /// Orca's user-facing terminal projection, joined by `ptyId`. This supplies
+    /// titles/agent identities and visual ordering from the public CLI.
     orca_terminal_catalog: Vec<OrcaTerminal>,
     /// Feature 5: adaptive frame scheduler — throttles rendering to a 60fps
     /// budget, skips frames when behind (backpressure), and backs off the poll
@@ -234,8 +234,8 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     coordinator: Option<Coordinator>,
     /// The agent binary used to run orchestrated tasks (e.g. `claude`).
     orch_agent: Option<String>,
-    /// Shared session-ID → pane-index map for the daemon stream reader thread.
-    /// `None` when not in daemon mode.
+    /// Legacy session-ID → pane-index map for the built-in daemon stream.
+    /// The public Orca CLI path never populates it.
     daemon_session_map:
         Option<std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>>,
     /// Reconnect attempt counter (resets to 0 on successful connect).
@@ -247,8 +247,8 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
             Option<Result<DaemonConnection, crate::orca_daemon::DaemonError>>,
         >,
     >,
-    /// In-flight createOrAttach RPC, completed by a worker and applied on the
-    /// next UI tick so dynamic pane creation never blocks input/rendering.
+    /// Legacy in-flight daemon create RPCs. Public Orca creates use
+    /// `orca_spawn_rx` below.
     daemon_spawn_rx: Vec<(usize, String, DaemonSpawnReceiver)>,
     /// PTY size captured at construction, reused by [`App::spawn_one`].
     cols: u16,
@@ -271,9 +271,19 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     toasts: crate::toast::ToastQueue,
     /// The daemon client when connected to an Orca daemon (None in standalone).
     daemon: Option<DaemonConnection>,
-    /// Daemon sessions whose TUI tab was closed and therefore must be killed
-    /// before the TUI exits. Keeping the IDs after removing the pane closes
-    /// the race where a user closes a tab and immediately quits the TUI.
+    /// Public Orca CLI/runtime adapter. Unlike `daemon`, this never opens a
+    /// private Unix socket or attaches to a PTY owned by Orca's GUI.
+    orca_cli: Option<OrcaCliBridge>,
+    orca_poll_stop: Option<Arc<AtomicBool>>,
+    orca_send_tx: Option<std::sync::mpsc::Sender<(String, Vec<u8>, bool)>>,
+    orca_spawn_rx: Vec<(
+        usize,
+        std::sync::mpsc::Receiver<anyhow::Result<CreatedTerminal>>,
+    )>,
+    orca_closed_handles: std::collections::HashSet<String>,
+    orca_cancelled_panes: std::collections::HashSet<usize>,
+    /// Legacy daemon session IDs queued for teardown. Public Orca CLI tabs use
+    /// runtime handles and are closed synchronously in `close_daemon_sessions`.
     daemon_cleanup_session_ids: Vec<String>,
     /// Set by SIGHUP/SIGTERM/SIGINT so closing the terminal window follows
     /// the same graceful cleanup path as Ctrl+Q.
@@ -562,6 +572,12 @@ impl App {
             conn_state: ConnectionState::Standalone,
             toasts: crate::toast::ToastQueue::new(),
             daemon: None,
+            orca_cli: None,
+            orca_poll_stop: None,
+            orca_send_tx: None,
+            orca_spawn_rx: Vec::new(),
+            orca_closed_handles: std::collections::HashSet::new(),
+            orca_cancelled_panes: std::collections::HashSet::new(),
             daemon_cleanup_session_ids: Vec::new(),
             shutdown_signal: None,
             activity: ActivityLog::new(),
@@ -672,7 +688,7 @@ impl<B: Backend> App<B> {
     /// Whether the app currently owns a connection to Orca's daemon.
     #[must_use]
     pub fn daemon_connected(&self) -> bool {
-        self.daemon.is_some()
+        self.daemon.is_some() || self.orca_cli.is_some()
     }
 
     fn catalog_sidebar_entries(&self) -> Vec<crate::sidebar::SidebarEntry> {
@@ -845,10 +861,9 @@ impl<B: Backend> App<B> {
         let result = self.main_loop();
         // Always attempt teardown; surface it only if the loop itself succeeded.
         let restore_result = self.restore_terminal();
-        // A TUI tab is a view of an Orca daemon terminal. Once the TUI window
-        // closes, terminate every represented daemon session so the Orca GUI
-        // removes the matching terminal too. This runs after raw-mode teardown
-        // because the RPC can wait for the daemon's response.
+        // Only sessions explicitly created by this TUI are closed. Existing
+        // Orca GUI tabs are views and must survive TUI teardown.
+        self.stop_orca_cli_poller();
         self.close_daemon_sessions();
         if let Err(restore_err) = restore_result {
             if result.is_ok() {
@@ -999,6 +1014,7 @@ impl<B: Backend> App<B> {
             // attempt to reconnect on an exponential backoff.
             self.pump_daemon_reconnect();
             self.pump_daemon_spawns();
+            self.pump_orca_cli();
 
             // Poll with the scheduler-chosen timeout: ~remaining-to-next-frame
             // when active, the longer idle interval when nothing is happening.
@@ -1224,6 +1240,116 @@ impl<B: Backend> App<B> {
     /// Apply a single update to the matching pane/session.
     fn apply_update(&mut self, update: AgentUpdate) {
         match update {
+            AgentUpdate::OrcaInventory { terminals } => {
+                let terminals: Vec<_> = terminals
+                    .into_iter()
+                    .filter(|terminal| !self.orca_closed_handles.contains(&terminal.handle))
+                    .collect();
+                let handles: std::collections::HashSet<String> = terminals
+                    .iter()
+                    .map(|terminal| terminal.handle.clone())
+                    .collect();
+                self.panes.retain(|slot| match slot.session_owner {
+                    SessionOwner::Local => true,
+                    SessionOwner::OrcaExisting | SessionOwner::OrcaTuiOwned => slot
+                        .orca_handle
+                        .as_ref()
+                        .map_or(true, |handle| handles.contains(handle)),
+                });
+                if self.panes.is_empty() {
+                    self.focus = 0;
+                } else if self.focus >= self.panes.len() {
+                    self.focus = self.panes.len() - 1;
+                }
+                self.orca_terminal_catalog = terminals;
+                let focused_id = self.panes.get(self.focus).map(|slot| slot.id());
+                self.panes.sort_by_key(|slot| {
+                    slot.orca_handle
+                        .as_ref()
+                        .and_then(|handle| {
+                            self.orca_terminal_catalog
+                                .iter()
+                                .find(|terminal| &terminal.handle == handle)
+                        })
+                        .map(|terminal| terminal.order)
+                        .unwrap_or(usize::MAX)
+                });
+                if let Some(id) = focused_id {
+                    if let Some(index) = self.idx_of_pane(id) {
+                        self.focus = index;
+                    }
+                }
+            }
+            AgentUpdate::OrcaSnapshot {
+                terminal,
+                lines,
+                status,
+            } => {
+                if self.orca_closed_handles.contains(&terminal.handle) {
+                    return;
+                }
+                let Some(index) = self
+                    .panes
+                    .iter()
+                    .position(|slot| slot.orca_handle.as_deref() == Some(terminal.handle.as_str()))
+                else {
+                    if let Some(index) = self.panes.iter().position(|slot| {
+                        slot.session_owner == SessionOwner::OrcaTuiOwned
+                            && slot.orca_handle.is_none()
+                    }) {
+                        let slot = &mut self.panes[index];
+                        slot.orca_handle = Some(terminal.handle.clone());
+                        slot.daemon_session_id = Some(terminal.pty_id.clone());
+                        slot.pane.set_state(orca_status_to_state(status.as_deref()));
+                        slot.pane.replace_screen(&lines);
+                        return;
+                    }
+                    let id = self.next_pane_id;
+                    self.next_pane_id += 1;
+                    let mut pane = Pane::new(
+                        id,
+                        terminal
+                            .title
+                            .clone()
+                            .or_else(|| terminal.agent_identity.clone())
+                            .unwrap_or_else(|| terminal.handle.clone()),
+                        self.cols,
+                        self.rows,
+                    );
+                    pane.set_state(orca_status_to_state(status.as_deref()));
+                    pane.set_branch(terminal.branch.clone().or_else(|| {
+                        terminal
+                            .worktree_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                    }));
+                    pane.replace_screen(&lines);
+                    let mut slot = PaneSlot::new(pane, Vec::new());
+                    slot.daemon_session_id = Some(terminal.pty_id.clone());
+                    slot.orca_handle = Some(terminal.handle.clone());
+                    slot.session_owner = SessionOwner::OrcaExisting;
+                    slot.daemon_read_only = true;
+                    slot.workspace_id = terminal.worktree_id.clone();
+                    slot.worktree_path = terminal.worktree_path.clone();
+                    self.panes.push(slot);
+                    return;
+                };
+                let slot = &mut self.panes[index];
+                if let Some(title) = terminal.title.as_deref().filter(|title| !title.is_empty()) {
+                    slot.pane.set_name(title);
+                }
+                slot.pane.set_state(orca_status_to_state(status.as_deref()));
+                slot.pane.set_branch(terminal.branch.clone().or_else(|| {
+                    terminal
+                        .worktree_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                }));
+                slot.pane.replace_screen(&lines);
+                slot.daemon_session_id = Some(terminal.pty_id);
+                slot.workspace_id = terminal.worktree_id;
+                slot.worktree_path = terminal.worktree_path;
+            }
             AgentUpdate::Output { pane_id, bytes } => {
                 // The forwarder (and daemon stream reader) report the pane by
                 // its STABLE id; resolve to a position before indexing the
@@ -1375,10 +1501,88 @@ impl<B: Backend> App<B> {
     /// Returns the new pane index.
     fn spawn_one(&mut self, spec: AgentSpec) -> usize {
         let spec = self.contextualize_spec(spec);
+        if self.orca_cli.is_some() {
+            return self.spawn_one_orca_cli(spec);
+        }
         if self.daemon.is_some() {
             return self.spawn_one_daemon(spec);
         }
         self.spawn_one_local(spec)
+    }
+
+    fn spawn_one_orca_cli(&mut self, spec: AgentSpec) -> usize {
+        let idx = self.panes.len();
+        let id = self.next_pane_id;
+        self.next_pane_id += 1;
+        let command = spec.command.clone();
+        let command_text = command
+            .iter()
+            .map(|arg| crate::orca_cli_bridge::shell_quote(std::ffi::OsStr::new(arg)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let pane = Pane::new(id, &spec.name, self.cols, self.rows);
+        let mut slot = PaneSlot::new(pane, command);
+        slot.workspace_id = spec.workspace_id.clone();
+        slot.worktree_path = spec.worktree.clone();
+        slot.session_owner = SessionOwner::OrcaTuiOwned;
+        self.panes.push(slot);
+        let Some(bridge) = self.orca_cli.clone() else {
+            return idx;
+        };
+        let worktree = spec
+            .worktree
+            .as_ref()
+            .map(|path| format!("path:{}", path.display()));
+        let title = Some(spec.name.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = thread::Builder::new()
+            .name("orca-cli-create".into())
+            .spawn(move || {
+                let _ =
+                    tx.send(bridge.create(worktree.as_deref(), &command_text, title.as_deref()));
+            });
+        self.orca_spawn_rx.push((id, rx));
+        idx
+    }
+
+    fn pump_orca_cli(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let pending = std::mem::take(&mut self.orca_spawn_rx);
+        let mut changed = false;
+        for (pane_id, rx) in pending {
+            match rx.try_recv() {
+                Ok(Ok(created)) => {
+                    if self.orca_cancelled_panes.remove(&pane_id) {
+                        if let Some(bridge) = self.orca_cli.clone() {
+                            let _ = bridge.close_tab(&created.handle);
+                        }
+                    } else if let Some(index) = self.idx_of_pane(pane_id) {
+                        let slot = &mut self.panes[index];
+                        slot.orca_handle = Some(created.handle);
+                        slot.daemon_session_id = created.pty_id;
+                        slot.session_owner = SessionOwner::OrcaTuiOwned;
+                        slot.daemon_read_only = false;
+                        slot.set_state(AgentState::Running);
+                    }
+                    changed = true;
+                }
+                Ok(Err(error)) => {
+                    if let Some(index) = self.idx_of_pane(pane_id) {
+                        self.panes[index].set_state(AgentState::Failed(error.to_string()));
+                    }
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => self.orca_spawn_rx.push((pane_id, rx)),
+                Err(TryRecvError::Disconnected) => {
+                    if let Some(index) = self.idx_of_pane(pane_id) {
+                        self.panes[index]
+                            .set_state(AgentState::Failed("Orca create worker stopped".to_owned()));
+                    }
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// Daemon-mode spawn: creates an Idle placeholder immediately, then sends
@@ -1414,6 +1618,7 @@ impl<B: Backend> App<B> {
         let mut slot = PaneSlot::new(pane, command.clone());
         slot.workspace_id = spec.workspace_id.clone();
         slot.worktree_path = spec.worktree.clone();
+        slot.session_owner = SessionOwner::OrcaTuiOwned;
         self.panes.push(slot);
         let rx = self
             .daemon
@@ -1828,6 +2033,7 @@ impl<B: Backend> App<B> {
                 slot.workspace_id = terminal_workspace_id;
                 slot.worktree_path = terminal_workspace_path;
                 slot.daemon_read_only = true;
+                slot.session_owner = SessionOwner::OrcaExisting;
                 self.panes.push(slot);
                 pane_id
             };
@@ -1869,122 +2075,148 @@ impl<B: Backend> App<B> {
         hydrated
     }
 
-    /// Try to connect to an Orca GUI daemon (--daemon flag). On success,
-    /// switches to daemon mode. Existing GUI sessions are snapshot-only;
-    /// input is forwarded via RPC only for sessions created by this TUI. On
-    /// failure, falls back to standalone silently (no daemon found) or with a
-    /// toast (daemon found but connection rejected).
+    /// Connect to Orca through its public CLI.  This is deliberately a
+    /// process-based viewer: no daemon Unix socket, stream attachment,
+    /// `write`, `resize`, or `kill` RPC is opened for GUI-owned sessions.
     pub fn try_connect_daemon(&mut self) {
-        use crate::orca_daemon::{DaemonConnectOptions, DaemonError};
-        use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
-        let opts = DaemonConnectOptions {
-            rpc_timeout: Duration::from_secs(self.config.daemon.rpc_timeout_secs),
-            hello_timeout: Duration::from_secs(self.config.daemon.hello_timeout_secs),
-        };
-        match DaemonConnection::try_connect(opts) {
-            None => {
-                // No daemon socket found — silent standalone fallback.
-            }
-            Some(Ok(mut client)) => {
-                let pid = client.identity().pid;
-
-                self.refresh_orca_terminal_catalog();
-
-                // Build the session-ID → stable-pane-id map for the stream
-                // reader. We store the pane's STABLE id (not its position `i`),
-                // so the reader's `AgentUpdate::Output { pane_id }` survives a
-                // position shift when another pane closes.
-                let session_map: Arc<Mutex<HashMap<String, usize>>> =
-                    Arc::new(Mutex::new(HashMap::new()));
-                let hydrated = self.hydrate_daemon_sessions(&mut client, &session_map);
-                for pane in &self.panes {
-                    let sid = pane.daemon_session_id.as_ref();
-                    if let Some(sid) = sid.filter(|_| !pane.daemon_read_only) {
-                        session_map.lock().unwrap().insert(sid.clone(), pane.id());
-                    }
-                }
-
-                // Take the stream socket and start a reader thread.
-                if let Some(mut stream) = client.take_stream() {
-                    // Store the map so spawn_one_daemon can register new sessions.
-                    self.daemon_session_map = Some(Arc::clone(&session_map));
-                    let map = Arc::clone(&session_map);
-                    let tx = self.bus_tx.clone();
-                    let _ = thread::Builder::new()
-                        .name("orca-daemon-stream".to_string())
-                        .spawn(move || {
-                            use crate::daemon_connection::DaemonConnection;
-                            use crate::orca_daemon::FrameType;
-                            loop {
-                                match DaemonConnection::read_stream_frame(&mut stream) {
-                                    Ok(frame) => {
-                                        match frame.ftype {
-                                            FrameType::Data => {
-                                                // Parse NDJSON {sessionId, data} or treat as raw for pane 0.
-                                                if let Some((pane_id, bytes)) =
-                                                    parse_stream_data(&frame.payload, &map)
-                                                {
-                                                    let _ = tx.send(AgentUpdate::Output {
-                                                        pane_id,
-                                                        bytes,
-                                                    });
-                                                }
-                                            }
-                                            FrameType::Event => {
-                                                // Parse NDJSON event (exit, etc.).
-                                                if let Some((pane_id, code)) =
-                                                    parse_stream_event(&frame.payload, &map)
-                                                {
-                                                    let _ = tx.send(AgentUpdate::Exit {
-                                                        pane_id,
-                                                        code: Some(code),
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(DaemonError::Disconnected { reason: _ }) => {
-                                        // Signal all panes as exited.
-                                        let ids: Vec<usize> = {
-                                            let m = map.lock().unwrap();
-                                            m.values().copied().collect()
-                                        };
-                                        for id in ids {
-                                            let _ = tx.send(AgentUpdate::Exit {
-                                                pane_id: id,
-                                                code: None,
-                                            });
-                                        }
-                                        break;
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                        });
-                }
-
-                self.daemon = Some(client);
+        let bridge = OrcaCliBridge::new();
+        match bridge.list_terminals() {
+            Ok(terminals) => {
+                let terminals = filter_host_terminal(terminals);
+                let count = self.hydrate_cli_terminals(&terminals);
+                self.orca_terminal_catalog = terminals.clone();
+                self.start_orca_cli_poller(bridge.clone());
+                self.start_orca_sender(bridge.clone());
+                self.orca_cli = Some(bridge);
                 self.conn_state = ConnectionState::Connected;
-                self.daemon_reconnect_attempts = 0;
-                self.daemon_backoff =
-                    Duration::from_secs(self.config.daemon.reconnect_initial_secs);
                 self.toasts.push(crate::toast::Toast::success(format!(
-                    "Connected to Orca daemon (pid {pid}), {hydrated} 个终端（已有会话只读）"
+                    "Connected to Orca runtime via CLI, {count} 个终端（GUI 会话只读）"
                 )));
             }
-            Some(Err(e)) => {
-                let reason = match &e {
-                    DaemonError::Connect(_) => "daemon socket unreachable".to_string(),
-                    DaemonError::HelloRejected { message } => format!("rejected: {message}"),
-                    DaemonError::Disconnected { reason } => reason.clone(),
-                    _ => e.to_string(),
-                };
+            Err(error) => {
                 self.toasts.push(crate::toast::Toast::warning(format!(
-                    "Daemon connect failed ({reason}). Running standalone."
+                    "Orca CLI unavailable ({error}). Running standalone."
                 )));
             }
         }
+    }
+
+    fn hydrate_cli_terminals(&mut self, terminals: &[OrcaTerminal]) -> usize {
+        let mut count = 0;
+        for terminal in terminals {
+            let title = terminal
+                .title
+                .clone()
+                .or_else(|| terminal.agent_identity.clone())
+                .unwrap_or_else(|| terminal.handle.clone());
+            let state = AgentState::Running;
+            if let Some(index) = self
+                .panes
+                .iter()
+                .position(|slot| slot.orca_handle.as_deref() == Some(terminal.handle.as_str()))
+            {
+                let slot = &mut self.panes[index];
+                slot.pane.set_name(title);
+                slot.pane.set_state(state);
+                count += 1;
+                continue;
+            }
+            let mut pane = Pane::new(self.next_pane_id, title, self.cols, self.rows);
+            self.next_pane_id += 1;
+            pane.set_state(state);
+            pane.set_branch(terminal.branch.clone().or_else(|| {
+                terminal
+                    .worktree_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            }));
+            let mut slot = PaneSlot::new(pane, Vec::new());
+            slot.daemon_session_id = Some(terminal.pty_id.clone());
+            slot.orca_handle = Some(terminal.handle.clone());
+            slot.session_owner = SessionOwner::OrcaExisting;
+            slot.daemon_read_only = true;
+            slot.workspace_id = terminal.worktree_id.clone();
+            slot.worktree_path = terminal.worktree_path.clone();
+            self.panes.push(slot);
+            count += 1;
+        }
+        count
+    }
+
+    fn start_orca_cli_poller(&mut self, bridge: OrcaCliBridge) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let tx = self.bus_tx.clone();
+        let _ = thread::Builder::new()
+            .name("orca-cli-poller".into())
+            .spawn(move || {
+                while !stop_thread.load(Ordering::Relaxed) {
+                    if let Ok(terminals) = bridge.list_terminals() {
+                        let terminals = filter_host_terminal(terminals);
+                        let _ = tx.send(AgentUpdate::OrcaInventory {
+                            terminals: terminals.clone(),
+                        });
+                        for terminal in terminals {
+                            if let Ok(screen) = bridge.read_screen(&terminal.handle) {
+                                let _ = tx.send(AgentUpdate::OrcaSnapshot {
+                                    terminal,
+                                    lines: screen.lines,
+                                    status: screen.status,
+                                });
+                            }
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+            });
+        self.orca_poll_stop = Some(stop);
+    }
+
+    fn start_orca_sender(&mut self, bridge: OrcaCliBridge) {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<u8>, bool)>();
+        let _ = thread::Builder::new()
+            .name("orca-cli-sender".into())
+            .spawn(move || {
+                let mut pending = None;
+                loop {
+                    let first = match pending.take().or_else(|| rx.recv().ok()) {
+                        Some(message) => message,
+                        None => break,
+                    };
+                    let (handle, mut bytes, mut enter) = first;
+                    let deadline = Instant::now() + Duration::from_millis(15);
+                    while !enter {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        match rx.recv_timeout(remaining) {
+                            Ok((next_handle, next_bytes, next_enter)) if next_handle == handle => {
+                                bytes.extend(next_bytes);
+                                enter = next_enter;
+                            }
+                            Ok(message) => {
+                                pending = Some(message);
+                                break;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                pending = None;
+                                break;
+                            }
+                        }
+                    }
+                    let _ = bridge.send_text(&handle, &String::from_utf8_lossy(&bytes), enter);
+                }
+            });
+        self.orca_send_tx = Some(tx);
+    }
+
+    fn stop_orca_cli_poller(&mut self) {
+        if let Some(stop) = self.orca_poll_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.orca_send_tx = None;
     }
 
     pub fn enable_reconnect(&mut self) {
@@ -2076,178 +2308,12 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// Daemon reconnection pump. Called once per loop tick. When in
-    /// `Disconnected` state and the retry deadline has elapsed, attempts to
-    /// reconnect. On success: rebuilds the session map and pushes a success
-    /// toast. On failure: doubles the backoff (capped at 30s) and tries again.
+    /// Legacy daemon reconnection hook. GUI integration uses the CLI poller,
+    /// whose next successful `terminal list` automatically repairs a transient
+    /// runtime outage. Keeping this hook a no-op prevents the old Unix-socket
+    /// reconnect path from ever being selected by `run --daemon`.
     fn pump_daemon_reconnect(&mut self) {
-        use crate::orca_daemon::DaemonError;
-        use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
-
-        // Only act when in Disconnected state with a retry deadline.
-        let next_retry = match &self.conn_state {
-            ConnectionState::Disconnected { next_retry, .. } => *next_retry,
-            _ => return,
-        };
-        let Some(deadline) = next_retry else {
-            return; // no retry scheduled (max attempts exhausted)
-        };
-        if Instant::now() < deadline {
-            return; // not yet time
-        }
-
-        // Start at most one bounded worker; the UI keeps polling while the
-        // socket handshake runs off-thread.
-        if self.daemon_reconnect_rx.is_none() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.daemon_reconnect_rx = Some(rx);
-            let opts = crate::orca_daemon::DaemonConnectOptions {
-                rpc_timeout: Duration::from_secs(self.config.daemon.rpc_timeout_secs),
-                hello_timeout: Duration::from_secs(self.config.daemon.hello_timeout_secs),
-            };
-            let spawned = std::thread::Builder::new()
-                .name("orca-daemon-reconnect".into())
-                .spawn(move || {
-                    let result = DaemonConnection::try_connect(opts);
-                    let _ = tx.send(result);
-                })
-                .is_ok();
-            if !spawned {
-                self.daemon_reconnect_rx = None;
-                self.toasts.push(crate::toast::Toast::warning(
-                    "无法启动 daemon 重连 worker，将稍后重试。",
-                ));
-            }
-            return;
-        }
-        let Some(rx) = self.daemon_reconnect_rx.as_ref() else {
-            return;
-        };
-        let Ok(result) = rx.try_recv() else {
-            return;
-        };
-        self.daemon_reconnect_rx = None;
-
-        match result {
-            None => {
-                // Daemon disappeared entirely — give up, go standalone.
-                self.conn_state = ConnectionState::Standalone;
-                self.toasts.push(crate::toast::Toast::warning(
-                    "Daemon gone. Switched to standalone.",
-                ));
-            }
-            Some(Ok(mut client)) => {
-                let pid = client.identity().pid;
-
-                self.refresh_orca_terminal_catalog();
-
-                // Rebuild the session-ID → stable-pane-id map (stable id, not
-                // position — see `try_connect_daemon`).
-                let session_map: Arc<Mutex<HashMap<String, usize>>> =
-                    Arc::new(Mutex::new(HashMap::new()));
-                let hydrated = self.hydrate_daemon_sessions(&mut client, &session_map);
-                for pane in &self.panes {
-                    if let Some(sid) = pane
-                        .daemon_session_id
-                        .as_ref()
-                        .filter(|_| !pane.daemon_read_only)
-                    {
-                        session_map.lock().unwrap().insert(sid.clone(), pane.id());
-                    }
-                }
-
-                // Start a fresh stream reader thread.
-                if let Some(mut stream) = client.take_stream() {
-                    self.daemon_session_map = Some(Arc::clone(&session_map));
-                    let map = Arc::clone(&session_map);
-                    let tx = self.bus_tx.clone();
-                    let _ = thread::Builder::new()
-                        .name("orca-daemon-stream".to_string())
-                        .spawn(move || {
-                            use crate::daemon_connection::DaemonConnection;
-                            use crate::orca_daemon::FrameType;
-                            loop {
-                                match DaemonConnection::read_stream_frame(&mut stream) {
-                                    Ok(frame) => match frame.ftype {
-                                        FrameType::Data => {
-                                            if let Some((pane_id, bytes)) =
-                                                parse_stream_data(&frame.payload, &map)
-                                            {
-                                                let _ =
-                                                    tx.send(AgentUpdate::Output { pane_id, bytes });
-                                            }
-                                        }
-                                        FrameType::Event => {
-                                            if let Some((pane_id, code)) =
-                                                parse_stream_event(&frame.payload, &map)
-                                            {
-                                                let _ = tx.send(AgentUpdate::Exit {
-                                                    pane_id,
-                                                    code: Some(code),
-                                                });
-                                            }
-                                        }
-                                    },
-                                    Err(DaemonError::Disconnected { .. }) => {
-                                        let ids: Vec<usize> = {
-                                            let m = map.lock().unwrap();
-                                            m.values().copied().collect()
-                                        };
-                                        for id in ids {
-                                            let _ = tx.send(AgentUpdate::Exit {
-                                                pane_id: id,
-                                                code: None,
-                                            });
-                                        }
-                                        break;
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                        });
-                }
-
-                self.daemon = Some(client);
-                self.conn_state = ConnectionState::Connected;
-                self.daemon_reconnect_attempts = 0;
-                self.daemon_backoff =
-                    Duration::from_secs(self.config.daemon.reconnect_initial_secs);
-                self.toasts.push(crate::toast::Toast::success(format!(
-                    "Reconnected to Orca daemon (pid {pid}), {hydrated} 个终端（已有会话只读）"
-                )));
-            }
-            Some(Err(e)) => {
-                // Still down — increase backoff (configurable cap).
-                self.daemon_reconnect_attempts += 1;
-                let max = self.config.daemon.reconnect_max_attempts;
-                if max > 0 && self.daemon_reconnect_attempts >= max {
-                    // Exhausted — give up, go standalone.
-                    self.conn_state = ConnectionState::Standalone;
-                    self.daemon = None;
-                    self.toasts.push(crate::toast::Toast::warning(
-                        "Daemon reconnect attempts exhausted. Switched to standalone.",
-                    ));
-                    return;
-                }
-                let prev_reason = match &self.conn_state {
-                    ConnectionState::Disconnected { reason, .. } => reason.clone(),
-                    _ => String::new(),
-                };
-                // Exponential backoff using config-driven initial/max.
-                let cap = Duration::from_secs(self.config.daemon.reconnect_max_secs);
-                let next_delay = (self.daemon_backoff * 2).min(cap);
-                self.daemon_backoff = next_delay;
-                self.conn_state = ConnectionState::Disconnected {
-                    reason: prev_reason,
-                    next_retry: Some(Instant::now() + next_delay),
-                };
-                self.toasts.push(crate::toast::Toast::warning(format!(
-                    "Reconnect failed ({e}). Retrying in {}s.",
-                    next_delay.as_secs()
-                )));
-            }
-        }
+        // The CLI poller is self-healing and owns its own retry cadence.
     }
 
     /// Feature 7: release every dependency-gated task the coordinator can
@@ -2296,6 +2362,7 @@ impl<B: Backend> App<B> {
         let catalog_entries = self.catalog_sidebar_entries();
         let (workspace_groups, workspace_targets) = self.workspace_sidebar_groups();
         let use_workspace_sidebar = self.daemon.is_some()
+            || self.orca_cli.is_some()
             || self.workspace_catalog_loaded
             || !self.workspace_catalog.is_empty();
         let workspace_width_entries: Vec<crate::sidebar::SidebarEntry> = workspace_groups
@@ -2480,8 +2547,15 @@ impl<B: Backend> App<B> {
                 }
             }
         }
-        if let (Some(daemon), Some((session_id, cols, rows))) = (&mut self.daemon, daemon_resize) {
-            daemon.enqueue_resize(session_id, cols, rows);
+        // Orca CLI screen projections are intentionally read-only. There is no
+        // resize call in that mode; retain the legacy daemon path only for the
+        // built-in daemon client.
+        if self.orca_cli.is_none() {
+            if let (Some(daemon), Some((session_id, cols, rows))) =
+                (&mut self.daemon, daemon_resize)
+            {
+                daemon.enqueue_resize(session_id, cols, rows);
+            }
         }
 
         // The render model was derived before layout so its workspace labels
@@ -3514,15 +3588,22 @@ impl<B: Backend> App<B> {
 
     fn request_quit(&mut self) {
         self.quit = true;
+        // Queue only explicitly-created Orca tabs for the legacy daemon
+        // teardown path; GUI-owned tabs remain untouched.
         self.queue_daemon_sessions_for_cleanup();
     }
 
     fn queue_daemon_sessions_for_cleanup(&mut self) {
-        self.daemon_cleanup_session_ids.extend(
-            self.panes
-                .iter()
-                .filter_map(|slot| slot.daemon_session_id.clone()),
-        );
+        self.daemon_cleanup_session_ids
+            .extend(self.panes.iter().filter_map(|slot| {
+                if self.orca_cli.is_some() {
+                    (slot.session_owner == SessionOwner::OrcaTuiOwned)
+                        .then(|| slot.daemon_session_id.clone())
+                        .flatten()
+                } else {
+                    slot.daemon_session_id.clone()
+                }
+            }));
         self.daemon_cleanup_session_ids.sort();
         self.daemon_cleanup_session_ids.dedup();
     }
@@ -4432,22 +4513,29 @@ impl<B: Backend> App<B> {
             return;
         }
         let idx = self.focus;
-        // `x` is the explicit close/kill action. For a local pane this kills
-        // its PTY; for any Orca pane it sends the daemon's `kill` RPC. A
-        // read-only snapshot is not writable, but closing its TUI tab is still
-        // an explicit request to close the matching Orca terminal.
+        // `x` is the explicit close action. Local PTYs are killed; an Orca
+        // terminal is closed only when this TUI created it. Existing GUI tabs
+        // are detached from this view without any remote mutation.
         if let Some(session) = self.panes[idx].session.as_mut() {
             let _ = session.kill();
         }
         if let Some(session_id) = self.panes[idx].daemon_session_id.clone() {
-            self.daemon_cleanup_session_ids.push(session_id.clone());
-            if let Some(daemon) = self.daemon.as_mut() {
-                if self.panes[idx].daemon_read_only {
-                    // Read-only tabs still close their matching Orca PTY, but
-                    // use the control socket directly so the GUI converges
-                    // before the TUI redraws the next tab.
-                    let _ = daemon.kill_session(&session_id);
-                } else {
+            let legacy_daemon = self.orca_cli.is_none();
+            if legacy_daemon || self.panes[idx].session_owner == SessionOwner::OrcaTuiOwned {
+                self.daemon_cleanup_session_ids.push(session_id.clone());
+                if let (Some(bridge), Some(handle)) = (
+                    self.orca_cli.as_ref(),
+                    self.panes[idx].orca_handle.as_deref(),
+                ) {
+                    let bridge = bridge.clone();
+                    let handle = handle.to_owned();
+                    self.orca_closed_handles.insert(handle.clone());
+                    let _ = thread::Builder::new()
+                        .name("orca-cli-close".into())
+                        .spawn(move || {
+                            let _ = bridge.close_tab(&handle);
+                        });
+                } else if let Some(daemon) = self.daemon.as_mut() {
                     daemon.enqueue_kill(session_id.clone());
                 }
             }
@@ -4457,6 +4545,10 @@ impl<B: Backend> App<B> {
         }
         // Dropping one slot removes the PTY and every item of pane-owned state
         // atomically; there are no sibling vectors to keep in lockstep.
+        let pane_id = self.panes[idx].id();
+        if self.orca_spawn_rx.iter().any(|(id, _)| *id == pane_id) {
+            self.orca_cancelled_panes.insert(pane_id);
+        }
         self.panes.remove(idx);
         // Keep the cached workspace-scoped tab projection coherent until the
         // next render rebuilds its hitboxes. This matters when a close key is
@@ -4485,17 +4577,32 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// Kill all Orca sessions represented by this TUI before disconnecting.
-    /// Session IDs are retained after a tab close so a close-then-quit race
-    /// cannot leave the GUI terminal alive. Errors are best effort: the TUI is
-    /// already exiting and a daemon that disappeared needs no further action.
+    /// Tear down sessions owned by this TUI. Orca-existing views are never
+    /// mutated; only runtime handles created by this process are closed.
     fn close_daemon_sessions(&mut self) {
-        let mut session_ids = std::mem::take(&mut self.daemon_cleanup_session_ids);
-        session_ids.extend(
-            self.panes
+        if let Some(bridge) = self.orca_cli.clone() {
+            let handles: Vec<String> = self
+                .panes
                 .iter()
-                .filter_map(|slot| slot.daemon_session_id.clone()),
-        );
+                .filter(|slot| slot.session_owner == SessionOwner::OrcaTuiOwned)
+                .filter_map(|slot| slot.orca_handle.clone())
+                .collect();
+            for handle in handles {
+                // `run` calls this after raw-mode restoration, so it is safe
+                // to wait for the public CLI command and guarantee teardown
+                // delivery before the process exits.
+                let _ = bridge.close_tab(&handle);
+            }
+            self.orca_cli = None;
+            self.daemon_cleanup_session_ids.clear();
+            return;
+        }
+        let mut session_ids = std::mem::take(&mut self.daemon_cleanup_session_ids);
+        session_ids.extend(self.panes.iter().filter_map(|slot| {
+            (slot.session_owner == SessionOwner::OrcaTuiOwned)
+                .then(|| slot.daemon_session_id.clone())
+                .flatten()
+        }));
         session_ids.sort();
         session_ids.dedup();
 
@@ -4518,6 +4625,23 @@ impl<B: Backend> App<B> {
     /// TUI. Existing Orca GUI sessions are read-only snapshots; forwarding
     /// their input would mutate the GUI session without owning its stream.
     fn send_to_focused(&mut self, bytes: &[u8]) {
+        if self.orca_cli.is_some() {
+            let Some(slot) = self.panes.get(self.focus) else {
+                return;
+            };
+            if slot.session_owner != SessionOwner::OrcaTuiOwned {
+                return;
+            }
+            let Some(handle) = slot.orca_handle.clone() else {
+                return;
+            };
+            if let Some(tx) = &self.orca_send_tx {
+                let enter = bytes == b"\r";
+                let payload = if enter { Vec::new() } else { bytes.to_vec() };
+                let _ = tx.send((handle, payload, enter));
+            }
+            return;
+        }
         if let Some(daemon) = &mut self.daemon {
             if self
                 .panes
@@ -4620,6 +4744,22 @@ fn parse_stream_data(
     Some((0, payload.to_vec()))
 }
 
+fn filter_host_terminal(terminals: Vec<OrcaTerminal>) -> Vec<OrcaTerminal> {
+    let host = std::env::var("ORCA_TERMINAL_HANDLE").ok();
+    terminals
+        .into_iter()
+        .filter(|terminal| host.as_deref() != Some(terminal.handle.as_str()))
+        .collect()
+}
+
+fn orca_status_to_state(status: Option<&str>) -> AgentState {
+    match status.unwrap_or("running") {
+        "exited" | "done" | "closed" => AgentState::Done(None),
+        "created" | "spawning" | "idle" => AgentState::Idle,
+        _ => AgentState::Running,
+    }
+}
+
 /// Parse an Event-frame payload for an exit event.
 ///
 /// Returns `Some((pane_id, exit_code))` for exit events, `None` otherwise.
@@ -4682,6 +4822,7 @@ impl<B: Backend> Drop for App<B> {
         // Covers panic paths and callers that construct an App without
         // entering `run`; the normal path already took the same connection in
         // `run`, so this is a no-op after a clean exit.
+        self.stop_orca_cli_poller();
         self.close_daemon_sessions();
         // Panic-safety: if `run` never restored (or panicked mid-loop), make
         // one best-effort attempt to give the user their terminal back. The
@@ -4756,6 +4897,12 @@ mod tests {
                 conn_state: ConnectionState::Standalone,
                 toasts: crate::toast::ToastQueue::new(),
                 daemon: None,
+                orca_cli: None,
+                orca_poll_stop: None,
+                orca_send_tx: None,
+                orca_spawn_rx: Vec::new(),
+                orca_closed_handles: std::collections::HashSet::new(),
+                orca_cancelled_panes: std::collections::HashSet::new(),
                 daemon_cleanup_session_ids: Vec::new(),
                 shutdown_signal: None,
                 activity: ActivityLog::new(),
@@ -6513,6 +6660,54 @@ mod tests {
             bytes: b"nope".to_vec(),
         });
         assert_eq!(app.panes.len(), 2, "no pane added for an OOB pane_id");
+    }
+
+    #[test]
+    fn cli_snapshot_updates_existing_view_without_ownership_mutation() {
+        let mut app = App::for_test(vec![]);
+        let terminal = OrcaTerminal {
+            pty_id: "pty-1".into(),
+            handle: "term-1".into(),
+            title: Some("GUI tab".into()),
+            agent_identity: Some("codex".into()),
+            worktree_id: Some("workspace-1".into()),
+            worktree_path: None,
+            branch: Some("main".into()),
+            order: 0,
+        };
+        app.apply_update(AgentUpdate::OrcaSnapshot {
+            terminal,
+            lines: vec!["hello from Orca".into()],
+            status: Some("running".into()),
+        });
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.panes[0].name(), "GUI tab");
+        assert_eq!(app.panes[0].session_owner, SessionOwner::OrcaExisting);
+        assert!(app.panes[0].daemon_read_only);
+        assert_eq!(app.panes[0].emulator().cell(0, 0).unwrap().chars, "h");
+    }
+
+    #[test]
+    fn cli_view_does_not_forward_input_to_existing_orca_tab() {
+        let mut app = App::for_test(vec![pane(0, "GUI tab")]);
+        app.panes[0].orca_handle = Some("term-1".into());
+        app.panes[0].session_owner = SessionOwner::OrcaExisting;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.orca_send_tx = Some(tx);
+        app.orca_cli = Some(OrcaCliBridge::with_executable("true"));
+        app.send_to_focused(b"x");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cli_inventory_removes_gui_closed_view_but_keeps_local_pane() {
+        let mut app = App::for_test(vec![pane(0, "gui"), pane(1, "local")]);
+        app.panes[0].orca_handle = Some("gone".into());
+        app.panes[0].session_owner = SessionOwner::OrcaExisting;
+        app.panes[1].session = None;
+        app.apply_update(AgentUpdate::OrcaInventory { terminals: vec![] });
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.panes[0].name(), "local");
     }
 
     #[test]

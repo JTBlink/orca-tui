@@ -4,12 +4,11 @@
 //! `App` to connection lifecycle and RPC operations, keeping protocol details
 //! out of input/render code.
 
-use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 
 use crate::orca_daemon::{
-    DaemonClient, DaemonConnectOptions, DaemonEndpoint, DaemonError, DaemonIdentity, Frame,
+    DaemonClient, DaemonConnectOptions, DaemonEndpoint, DaemonError, DaemonIdentity,
 };
 
 /// 供 App 使用的 daemon 连接边界。
@@ -208,15 +207,5 @@ impl DaemonConnection {
             })
             .ok();
         rx
-    }
-
-    /// 取出 stream socket，交给后台 reader 线程。
-    pub(crate) fn take_stream(&mut self) -> Option<UnixStream> {
-        self.client.take_stream()
-    }
-
-    /// 读取 stream 帧；协议解析仍集中在 `orca_daemon`。
-    pub(crate) fn read_stream_frame(stream: &mut UnixStream) -> Result<Frame, DaemonError> {
-        DaemonClient::read_stream_frame(stream)
     }
 }

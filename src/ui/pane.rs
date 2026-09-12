@@ -136,6 +136,11 @@ impl Pane {
         &self.name
     }
 
+    pub(crate) fn set_name(&mut self, name: impl Into<String>) {
+        self.name = name.into();
+        self.last_title.clear();
+    }
+
     /// Feed raw PTY bytes into the emulator. OSC 9999 agent-status sequences
     /// are intercepted by the [`OscScanner`](crate::osc::OscScanner) before
     /// reaching the terminal emulator, so they don't corrupt the display and
@@ -158,6 +163,24 @@ impl Pane {
             self.scroll = 0;
             self.grid_dirty = true;
         }
+    }
+
+    /// Replace the emulator with a text-only screen projection returned by
+    /// Orca's public CLI. This deliberately does not pretend the projection
+    /// is a PTY byte stream: it resets the visible screen and paints the
+    /// returned lines, preserving the non-owning viewer invariant.
+    pub fn replace_screen(&mut self, lines: &[String]) {
+        let (cols, rows) = self.emu.size();
+        self.emu = TerminalEmulator::new(cols, rows, SCROLLBACK);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x1b[2J\x1b[H");
+        for (index, line) in lines.iter().enumerate() {
+            if index > 0 {
+                bytes.extend_from_slice(b"\r\n");
+            }
+            bytes.extend_from_slice(line.as_bytes());
+        }
+        self.feed(&bytes);
     }
 
     /// Resize the emulator viewport (PTY-side resize is Task 4's job).

@@ -35,6 +35,16 @@ use crate::agent::AgentState;
 pub enum AgentUpdate {
     /// Raw PTY bytes for `pane_id`. Feed verbatim into the pane's emulator.
     Output { pane_id: usize, bytes: Vec<u8> },
+    /// Updated Orca runtime terminal inventory (used by the CLI poller).
+    OrcaInventory {
+        terminals: Vec<crate::orca_workspaces::OrcaTerminal>,
+    },
+    /// A fresh text screen projection for one Orca runtime terminal.
+    OrcaSnapshot {
+        terminal: crate::orca_workspaces::OrcaTerminal,
+        lines: Vec<String>,
+        status: Option<String>,
+    },
     /// An out-of-band lifecycle state change (e.g. set to `Running` at spawn).
     State { pane_id: usize, state: AgentState },
     /// The agent process behind `pane_id` has exited. `code` is the raw exit

@@ -192,10 +192,9 @@ fn try_main(cli: Cli) -> Result<()> {
 /// Resolve the no-subcommand convenience behavior without mixing it into
 /// subcommand dispatch.
 fn default_command() -> Command {
-    // Prefer the Orca GUI daemon when its versioned endpoint is present. This
-    // makes a bare `orca-tui` launch a true viewer of every currently open
-    // Orca terminal instead of creating local worktree panes. The built-in
-    // daemon remains the fallback when no Orca GUI endpoint is discoverable.
+    // Prefer the Orca runtime when its versioned endpoint is present. The
+    // `--daemon` flag now uses the public `orca terminal` CLI bridge, while
+    // the built-in daemon remains the fallback when no GUI runtime is found.
     if crate::orca_daemon::DaemonEndpoint::discover().is_some() {
         return Command::Run {
             cwd: None,
@@ -273,8 +272,8 @@ fn dispatch_command(command: Command) -> Result<()> {
                 // explicit command is deliberately not a startup create;
                 // it is retained separately for standalone fallback.
                 let catalog = orca_workspaces::list_all_with_scope().unwrap_or_default();
-                // A GUI daemon owns the PTYs that are already open in Orca.
-                // Startup in daemon mode is therefore an attach/hydrate
+                // A GUI runtime owns the PTYs that are already open in Orca.
+                // Startup in daemon mode is therefore a read-only hydrate
                 // operation; creating a terminal is an explicit in-TUI action
                 // (`+`, `n`, or the custom-command picker). Keep CLI command
                 // arguments available only for the standalone fallback below.
@@ -311,7 +310,7 @@ fn dispatch_command(command: Command) -> Result<()> {
                 unverifiable_scope_host_ids,
             );
 
-            // Try to connect to an Orca GUI daemon (--daemon). Falls back to
+            // Try to connect to an Orca GUI runtime (--daemon). Falls back to
             // standalone silently if no daemon is found; shows a toast if a
             // daemon was found but the connection failed.
             if daemon {

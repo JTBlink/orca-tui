@@ -14,6 +14,15 @@ use crate::pane::Pane;
 use crate::pty_session::PtySession;
 use crate::ssh::ReconnectSession;
 
+/// Explicit lifecycle ownership for a pane.  Existing Orca tabs are views;
+/// only tabs created by this TUI may receive input or be closed remotely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionOwner {
+    Local,
+    OrcaExisting,
+    OrcaTuiOwned,
+}
+
 /// All state that belongs to one pane.
 pub(crate) struct PaneSlot {
     pub(crate) pane: Pane,
@@ -25,11 +34,14 @@ pub(crate) struct PaneSlot {
     pub(crate) worktree_path: Option<PathBuf>,
     pub(crate) task: Option<TaskId>,
     pub(crate) daemon_session_id: Option<String>,
+    /// Runtime-issued Orca terminal handle used by the public CLI bridge.
+    pub(crate) orca_handle: Option<String>,
+    pub(crate) session_owner: SessionOwner,
     /// Existing Orca sessions are hydrated through the read-only snapshot
     /// RPC. They never receive input or resize requests from the TUI, because
     /// Orca's createOrAttach endpoint replaces the GUI's attachment owner.
-    /// Explicit tab/window close is separate and sends a kill RPC so the two
-    /// clients converge on the same terminal lifecycle.
+    /// Explicit tab/window close only removes the local view. A remote close
+    /// is allowed only for `SessionOwner::OrcaTuiOwned` handles.
     pub(crate) daemon_read_only: bool,
     pub(crate) reconnect: Option<ReconnectSession>,
     pub(crate) reconnect_due: Option<Instant>,
@@ -63,6 +75,8 @@ impl PaneSlot {
             worktree_path: None,
             task: None,
             daemon_session_id: None,
+            orca_handle: None,
+            session_owner: SessionOwner::Local,
             daemon_read_only: false,
             reconnect: None,
             reconnect_due: None,
@@ -80,6 +94,8 @@ impl std::fmt::Debug for PaneSlot {
             .field("command_len", &self.command.len())
             .field("has_task", &self.task.is_some())
             .field("has_daemon_session", &self.daemon_session_id.is_some())
+            .field("has_orca_handle", &self.orca_handle.is_some())
+            .field("session_owner", &self.session_owner)
             .field("daemon_read_only", &self.daemon_read_only)
             .field("reconnect", &self.reconnect.is_some())
             .field("reconnect_due", &self.reconnect_due)
@@ -104,6 +120,8 @@ mod tests {
         assert!(slot.session.is_none());
         assert!(slot.task.is_none());
         assert!(slot.daemon_session_id.is_none());
+        assert!(slot.orca_handle.is_none());
+        assert_eq!(slot.session_owner, SessionOwner::Local);
         assert!(!slot.daemon_read_only);
         assert!(slot.reconnect.is_none());
         assert!(slot.reconnect_due.is_none());
