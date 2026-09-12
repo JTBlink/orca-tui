@@ -54,7 +54,7 @@ Orca GUI：orca terminal list/read（CLI 子进程） -> App -> Pane -> ratatui
 | `query.rs` / `osc.rs` / `sync.rs` | 终端能力查询、活动 OSC、mode 2026 同步输出 |
 | `scheduler.rs` / `layout.rs` / `sidebar.rs` / `tab_bar.rs` | 刷新调度、兼容网格算法、侧边栏和终端 tabs |
 | `daemon_server.rs` | 内置 daemon、attach 协议和会话持有 |
-| `orca_daemon.rs` | Orca GUI daemon v36 客户端 |
+| `orca_daemon.rs` | Orca 私有 daemon 协议模型（兼容保留；GUI run 路径不使用） |
 | `cli_bridge.rs` | Orca 公共 `terminal` CLI 的 list/read/send/create/close 适配 |
 | `orca_workspaces.rs` | Orca CLI 全局 workspace catalog 读取、完整性校验和降级 |
 | `workspace_view.rs` | 完整 workspace inventory overlay 与窗口化滚动 |

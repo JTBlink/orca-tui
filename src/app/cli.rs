@@ -84,10 +84,10 @@ enum Command {
         #[arg(long)]
         all_worktrees: bool,
 
-        /// 尝试连接到运行中的 Orca GUI 守护进程以实现会话持久化和多客户端
-        /// （GUI + TUI）。连接成功时仅展示/附加 Orca 已有终端，不会因尾部
+        /// 尝试通过 Orca 公共 terminal CLI 连接运行中的 Orca GUI，以实现会话持久化和多客户端
+        /// （GUI + TUI）。连接成功时仅展示 Orca 已有终端，不会因尾部
         /// 命令参数自动创建 agent；新终端请在 TUI 中使用 `+` 或 `n`。如果
-        /// 未找到守护进程或连接失败，则对显式命令回退到独立模式（直接 PTY）。
+        /// 未找到 Orca CLI 或连接失败，则对显式命令回退到独立模式（直接 PTY）。
         #[arg(long)]
         daemon: bool,
 
