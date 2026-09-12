@@ -1542,8 +1542,19 @@ impl<B: Backend> App<B> {
         let _ = thread::Builder::new()
             .name("orca-cli-create".into())
             .spawn(move || {
-                let _ =
-                    tx.send(bridge.create(worktree.as_deref(), &command_text, title.as_deref()));
+                match bridge.create(worktree.as_deref(), &command_text, title.as_deref()) {
+                    Ok(created) => {
+                        if tx.send(Ok(created.clone())).is_err() {
+                            // The pane/app disappeared while `terminal create`
+                            // was in flight. Close the just-created tab so an
+                            // aborted TUI cannot leak an Orca session.
+                            let _ = bridge.close_tab(&created.handle);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error));
+                    }
+                }
             });
         self.orca_spawn_rx.push((id, rx));
         idx
