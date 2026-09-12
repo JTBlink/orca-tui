@@ -321,9 +321,7 @@ fn dispatch_command(command: Command) -> Result<()> {
                 // leave the GUI unable to receive input or output. There is
                 // no observer/read-only attachment role in this protocol, so
                 // fail closed instead of damaging the live Orca surface.
-                if std::env::var_os("ORCA_TERMINAL_HANDLE").is_some()
-                    || std::env::var("HERDR_ENV").as_deref() == Ok("1")
-                {
+                if running_inside_orca_terminal() {
                     anyhow::bail!(
                         "nested orca-tui is disabled inside an Orca/Herdr terminal; \
                          launch it from a separate system shell to avoid taking over PTYs"
@@ -493,6 +491,32 @@ fn dispatch_command(command: Command) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Detect every stable environment marker Orca exports to managed terminal
+/// processes. `ORCA_TERMINAL_HANDLE` is not present in some older shells, so
+/// checking only that variable lets a nested TUI slip through and reuse the
+/// current Orca PTY. Keep this predicate fail-closed: any marker is enough to
+/// require launching from a separate system terminal.
+fn running_inside_orca_terminal() -> bool {
+    // Herdr explicitly marks its managed terminals even when the underlying
+    // shell is a normal macOS Terminal process.
+    if std::env::var("HERDR_ENV").as_deref() == Ok("1") {
+        return true;
+    }
+    const ORCA_MARKERS: &[&str] = &[
+        "ORCA_TERMINAL_HANDLE",
+        "ORCA_PANE_KEY",
+        "ORCA_TAB_ID",
+        "ORCA_WORKSPACE_ID",
+        "ORCA_WORKTREE_ID",
+        "ORCA_AGENT_HOOK_ENDPOINT",
+        "ORCA_AGENT_HOOK_ENV",
+        "ORCA_APP_VERSION",
+    ];
+    ORCA_MARKERS
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
 }
 
 /// 将 CLI 的命令参数转换为 pane 启动规格。
@@ -1104,6 +1128,28 @@ fn run_attach(socket_path: &Path) -> Result<()> {
                                     && mouse.row < r.bottom()
                             }) {
                                 break;
+                            }
+                            // Close only the local attach-client tab. The
+                            // built-in daemon remains the owner of the PTY;
+                            // removing it from this view must not send a kill
+                            // request that would affect other clients.
+                            if let Some(idx) = tab_hitboxes.closes.iter().position(|rect| {
+                                rect.is_some_and(|r| {
+                                    mouse.column >= r.x
+                                        && mouse.column < r.right()
+                                        && mouse.row >= r.y
+                                        && mouse.row < r.bottom()
+                                })
+                            }) {
+                                if idx < panes.len() {
+                                    panes.remove(idx);
+                                    if panes.is_empty() {
+                                        focus = 0;
+                                    } else if focus >= panes.len() {
+                                        focus = panes.len() - 1;
+                                    }
+                                }
+                                continue;
                             }
                             if let Some(idx) = tab_hitboxes.tabs.iter().position(|r| {
                                 mouse.column >= r.x

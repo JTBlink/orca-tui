@@ -3,8 +3,9 @@
 //! Terminal multi-agent coding orchestrator — a TUI port of
 //! [Orca GUI](https://github.com/stablyai/orca). Runs N coding agents
 //! (Claude Code, Codex, OpenCode, …) as terminal tabs. Standalone mode owns
-//! local PTYs; Orca-daemon mode attaches to the daemon's existing PTY sessions,
-//! with one active terminal surface and a Herdr-style workspace sidebar.
+//! local PTYs; Orca-daemon mode reads existing GUI PTY sessions through
+//! read-only snapshots and owns only sessions it explicitly creates, with one
+//! active terminal surface and a Herdr-style workspace sidebar.
 //!
 //! The `orca-tui` **binary** is a thin wrapper around [`cli::run`]; every piece
 //! of logic lives in this library crate so it can be unit-tested, benchmarked

@@ -2,7 +2,8 @@
 
 `orca-tui` 是一个终端多 Agent 编排工具。独立模式下它为 Claude Code、Codex、OpenCode、Gemini CLI
 等命令行 Agent 创建本机 PTY；连接 Orca GUI daemon 时则复用 daemon 已打开的共享 PTY 会话。两种模式
-都以 Herdr 风格的 workspace/sidebar + terminal tabs 展示和管理，所有 tabs 共享当前窗口的一个真实终端表面。
+都以 Herdr 风格的 workspace/sidebar + terminal tabs 展示和管理：左侧先选工作区，横向 tab 只显示
+当前工作区的终端，所有 tabs 共享当前窗口的一个真实终端表面。
 
 项目支持直接管理本机 PTY、连接内置 daemon，以及连接 Orca GUI daemon。当前 crate 版本为
 `0.5.0`。
@@ -101,7 +102,7 @@ orca-tui run --cwd ./my-repo --worktree -- claude :: codex
 |---|---|:---:|---|
 | 独立模式 | `orca-tui run -- claude` | 否 | 当前进程直接创建和管理 PTY |
 | 内置 daemon | `orca-tui daemon -- claude` + `orca-tui attach` | 是 | daemon 持有 PTY，可多客户端连接 |
-| Orca GUI daemon | `orca-tui run --daemon` | 是 | 启动时只展示 daemon 已打开的全部终端；通过 `+`/`n` 显式创建新 tab，失败时对显式命令回退独立模式 |
+| Orca GUI daemon | `orca-tui run --daemon` | 是 | 启动时只读展示 daemon 已打开的终端；通过 `+`/`n` 显式创建由 TUI 拥有的新 tab |
 
 ### 内置 daemon
 
@@ -123,10 +124,13 @@ orca-tui run --daemon
 ```
 
 客户端会自动查找 Orca daemon v36 的 socket 和 token。连接成功后会调用 `listSessions`，为每个
-仍在运行的 Orca 窗体建立一个 tab，并通过 `createOrAttach(attachOnly)` 拉取当前快照和实时输出。
+仍在运行的 Orca 窗体建立一个只读 tab，并通过 `getSnapshot` 拉取当前快照；不会调用
+`createOrAttach(attachOnly)`，因此不会替换 Orca GUI 的输入 attachment。已存在的 Orca tab
+在 TUI 中不能输入或 resize；点击 tab 右侧的 `×` 只关闭 TUI 中的只读视图，不会终止 Orca
+会话。使用 tab 栏的 `+`/`n` 显式创建的新 tab 仍由 TUI 拥有并可交互。
 同时调用 `orca terminal list --include-visual-layouts --json`，按 `ptyId` 对齐 Orca 实际显示的
 标题、Agent 身份和 tab 顺序；这样 TUI 不会再用 cwd 或 bash/zsh 猜测 Agent 名称。切换 tab 不会
-创建新的 PTY。daemon 模式是展示/attach 客户端，不会因为命令行参数自动创建 agent；使用 tab 栏的
+创建新的 PTY。daemon 模式启动时是只读展示客户端，不会因为命令行参数自动创建 agent；使用 tab 栏的
 `+` 或 Pane 模式的 `n` 才会显式创建新终端。底部 `Ctrl+Q 退出` 旁的 `× 退出` 也支持鼠标点击。
 找不到 daemon 或握手失败时，若提供了显式命令则回退为独立模式运行；运行中断线会按 `[daemon]`
 配置尝试重连。内置 daemon 与 Orca GUI daemon 使用不同协议，不能混用。详见[技术设计](docs/TECHNICAL-DESIGN.md)。
@@ -156,7 +160,8 @@ token；当前仓库只提供服务端，不包含移动端页面。
 | `Ctrl+Alt+P` | 进入终端控制模式 |
 | `Ctrl+Q` / tab 栏 `× 退出` | 退出 TUI；attach/Orca daemon 模式下只断开展示客户端，不终止 daemon 会话 |
 | 鼠标滚轮 | 滚动当前终端历史输出 |
-| 鼠标点击 tab/workspace | 切换活动终端 |
+| 鼠标点击 tab/workspace | 切换活动终端；横向 tab 仅属于当前工作区 |
+| 点击 tab 右侧 `×` | 关闭当前 TUI tab；只读 Orca tab 仅断开视图，不终止 Orca 会话 |
 | 鼠标拖选 | 复制文本到系统剪贴板 |
 
 终端控制模式：
@@ -164,7 +169,7 @@ token；当前仓库只提供服务端，不包含移动端页面。
 | 按键 | 作用 |
 |---|---|
 | 方向键或 `h` `j` `k` `l` | 移动焦点 |
-| `Tab` / `Shift+Tab` | 切换下一个 / 上一个终端 tab |
+| `Tab` / `Shift+Tab` | 在当前工作区切换下一个 / 上一个终端 tab |
 | `p` | 固定或取消固定当前 Agent |
 | `x` | 终止并关闭当前 Agent |
 | `z` | 放大或恢复当前终端 |

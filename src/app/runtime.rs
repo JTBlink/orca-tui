@@ -276,12 +276,22 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     pane_rects: Vec<Rect>,
     /// Last-rendered tab hitboxes, used by mouse activation.
     tab_hitboxes: TabHitboxes,
+    /// Global pane indexes represented by the last-rendered horizontal tab
+    /// strip. In workspace mode the strip is scoped to the active workspace;
+    /// hit boxes themselves remain local to that filtered list.
+    tab_pane_indices: Vec<usize>,
     /// Last-rendered footer exit button, placed beside the Ctrl+Q hint.
     footer_quit_hitbox: Option<Rect>,
     /// Last-rendered sidebar region, used by workspace-row mouse activation.
     sidebar_rect: Option<Rect>,
     sidebar_entry_hitboxes: Vec<Option<Rect>>,
     sidebar_catalog_entries: Vec<OrcaWorkspace>,
+    /// Workspace-first sidebar hit testing. Pane hit boxes are indexed by the
+    /// stable pane vector; workspace hit boxes are indexed by the grouped
+    /// sidebar model built for the last frame.
+    sidebar_workspace_hitboxes: Vec<Option<Rect>>,
+    sidebar_pane_hitboxes: Vec<Option<Rect>>,
+    sidebar_workspace_targets: Vec<Option<OrcaWorkspace>>,
     /// The working directory agents are spawned in (the explicit `--cwd`, else
     /// the directory orcatui was launched from). Captured once at construction
     /// and reused by `spawn_one_local` / `respawn` so newly-spawned panes don't
@@ -544,10 +554,14 @@ impl App {
             activity: ActivityLog::new(),
             pane_rects: Vec::new(),
             tab_hitboxes: TabHitboxes::default(),
+            tab_pane_indices: Vec::new(),
             footer_quit_hitbox: None,
             sidebar_rect: None,
             sidebar_entry_hitboxes: Vec::new(),
             sidebar_catalog_entries: Vec::new(),
+            sidebar_workspace_hitboxes: Vec::new(),
+            sidebar_pane_hitboxes: Vec::new(),
+            sidebar_workspace_targets: Vec::new(),
             launch_cwd,
             debug_last_sidebar_signature: None,
             next_pane_id: next_id,
@@ -600,6 +614,29 @@ impl<B: Backend> App<B> {
         self.workspace_catalog = catalog;
     }
 
+    /// Inherit the focused local workspace when a new terminal is created from
+    /// the `+` button, spawn picker, task dispatcher, or orchestration pump.
+    /// Explicit workspace metadata always wins, so callers that deliberately
+    /// target another checkout remain unaffected.
+    fn contextualize_spec(&self, mut spec: AgentSpec) -> AgentSpec {
+        if spec.workspace_id.is_some() || spec.worktree.is_some() {
+            return spec;
+        }
+        let Some(slot) = self.panes.get(self.focus) else {
+            return spec;
+        };
+        let workspace = self.workspace_catalog.iter().find(|workspace| {
+            slot.workspace_id.as_deref() == Some(workspace.id.as_str())
+                || slot.worktree_path.as_ref() == Some(&workspace.path)
+        });
+        if let Some(workspace) = workspace.filter(|workspace| workspace.is_local()) {
+            spec.workspace_id = Some(workspace.id.clone());
+            spec.worktree = Some(workspace.path.clone());
+            spec.worktree_branch = Some(workspace.branch.clone());
+        }
+        spec
+    }
+
     /// Preserve whether an empty result was authoritative and attach any
     /// completeness warnings discovered while loading the catalog.
     pub fn set_workspace_catalog_status(
@@ -644,6 +681,72 @@ impl<B: Backend> App<B> {
                 pinned: false,
             })
             .collect()
+    }
+
+    /// Build the Orca-style workspace-first sidebar. Catalog rows are kept in
+    /// their source order, then live panes are attached by stable workspace id
+    /// (or checkout path for older terminal projections). Panes without
+    /// workspace metadata are grouped under a visible fallback row instead of
+    /// being silently flattened into the workspace list.
+    fn workspace_sidebar_groups(
+        &self,
+    ) -> (
+        Vec<crate::sidebar::WorkspaceSidebarGroup>,
+        Vec<Option<OrcaWorkspace>>,
+    ) {
+        let mut groups: Vec<crate::sidebar::WorkspaceSidebarGroup> = self
+            .workspace_catalog
+            .iter()
+            .map(|workspace| crate::sidebar::WorkspaceSidebarGroup {
+                id: Some(workspace.id.clone()),
+                name: workspace.sidebar_name(),
+                detail: workspace.sidebar_detail(),
+                agents: Vec::new(),
+            })
+            .collect();
+        let mut targets: Vec<Option<OrcaWorkspace>> =
+            self.workspace_catalog.iter().cloned().map(Some).collect();
+        let mut fallback_idx = None;
+        for (pane_idx, slot) in self.panes.iter().enumerate() {
+            let by_id = slot.workspace_id.as_deref().and_then(|id| {
+                groups
+                    .iter()
+                    .position(|group| group.id.as_deref() == Some(id))
+            });
+            let by_path = slot.worktree_path.as_ref().and_then(|path| {
+                self.workspace_catalog
+                    .iter()
+                    .position(|workspace| workspace.path == *path)
+            });
+            let group_idx = by_id.or(by_path).or_else(|| {
+                if fallback_idx.is_none() {
+                    fallback_idx = Some(groups.len());
+                    groups.push(crate::sidebar::WorkspaceSidebarGroup {
+                        id: None,
+                        name: if self.workspace_catalog.is_empty() {
+                            "Current workspace".to_owned()
+                        } else {
+                            "Open terminals".to_owned()
+                        },
+                        detail: None,
+                        agents: Vec::new(),
+                    });
+                    targets.push(None);
+                }
+                fallback_idx
+            });
+            let Some(group_idx) = group_idx else { continue };
+            let entry = crate::sidebar::SidebarEntry {
+                name: slot.name().to_owned(),
+                state: slot.state().clone(),
+                branch: slot.branch().map(str::to_owned),
+                activity: slot.activity().cloned(),
+                focused: pane_idx == self.focus,
+                pinned: slot.pinned,
+            };
+            groups[group_idx].agents.push((pane_idx, entry));
+        }
+        (groups, targets)
     }
 
     /// Build the complete workspace inventory used by the `w` overlay. When
@@ -1243,6 +1346,7 @@ impl<B: Backend> App<B> {
     /// mode, sends a `createOrAttach` RPC instead of spawning a local PTY.
     /// Returns the new pane index.
     fn spawn_one(&mut self, spec: AgentSpec) -> usize {
+        let spec = self.contextualize_spec(spec);
         if self.daemon.is_some() {
             return self.spawn_one_daemon(spec);
         }
@@ -1625,11 +1729,16 @@ impl<B: Backend> App<B> {
         for info in live_sessions {
             let cols = info.cols.max(MIN_COLS);
             let rows = info.rows.max(MIN_ROWS);
-            let response = match client.attach_session(&info.session_id, cols, rows) {
+            // Orca v36's `createOrAttach(attachOnly)` still calls
+            // `detachAllClients()`, so using it for an inventory viewer steals
+            // the GUI's input attachment. Hydration is therefore always
+            // snapshot-only, including after reconnect; there is no persisted
+            // ownership proof that would make a reattach safe.
+            let response = match client.snapshot_session(&info.session_id) {
                 Ok(response) => response,
                 Err(error) => {
                     self.toasts.push(crate::toast::Toast::warning(format!(
-                        "无法附加 Orca 终端 {}：{error}",
+                        "无法读取 Orca 终端 {}：{error}",
                         info.session_id
                     )));
                     continue;
@@ -1640,6 +1749,9 @@ impl<B: Backend> App<B> {
                 .orca_terminal_catalog
                 .iter()
                 .find(|terminal| terminal.pty_id == info.session_id);
+            let terminal_workspace_id = terminal.and_then(|terminal| terminal.worktree_id.clone());
+            let terminal_workspace_path =
+                terminal.and_then(|terminal| terminal.worktree_path.clone());
             let mut session_label =
                 Self::daemon_session_label(&info, foreground_process.as_deref(), terminal);
             // Preserve Orca titles exactly, including legitimate duplicates.
@@ -1663,6 +1775,16 @@ impl<B: Backend> App<B> {
                     pane.feed(&bytes);
                 }
                 self.panes[existing_idx].pane = pane;
+                if self.panes[existing_idx].workspace_id.is_none() {
+                    self.panes[existing_idx].workspace_id = terminal_workspace_id.clone();
+                }
+                if self.panes[existing_idx].worktree_path.is_none() {
+                    self.panes[existing_idx].worktree_path = terminal_workspace_path.clone();
+                }
+                // Preserve ownership established by this TUI. A session
+                // created through `+`/`n` already has a daemon id and remains
+                // writable across reconnects; only sessions first discovered
+                // from Orca's inventory are read-only snapshots.
                 pane_id
             } else {
                 let pane_id = self.next_pane_id;
@@ -1675,13 +1797,26 @@ impl<B: Backend> App<B> {
                 }
                 let mut slot = PaneSlot::new(pane, Vec::new());
                 slot.daemon_session_id = Some(info.session_id.clone());
+                slot.workspace_id = terminal_workspace_id;
+                slot.worktree_path = terminal_workspace_path;
+                slot.daemon_read_only = true;
                 self.panes.push(slot);
                 pane_id
             };
-            session_map
-                .lock()
-                .unwrap()
-                .insert(info.session_id.clone(), pane_id);
+            // Snapshot-only panes have no stream subscription. Keeping them
+            // out of this map prevents a later stream event from being
+            // misinterpreted as output for a pane that cannot receive it.
+            if !self
+                .panes
+                .iter()
+                .find(|pane| pane.id() == pane_id)
+                .is_some_and(|pane| pane.daemon_read_only)
+            {
+                session_map
+                    .lock()
+                    .unwrap()
+                    .insert(info.session_id.clone(), pane_id);
+            }
             hydrated += 1;
         }
         self.panes.sort_by_key(|pane| {
@@ -1707,9 +1842,10 @@ impl<B: Backend> App<B> {
     }
 
     /// Try to connect to an Orca GUI daemon (--daemon flag). On success,
-    /// switches to daemon mode (agent input is forwarded via RPC). On failure,
-    /// falls back to standalone silently (no daemon found) or with a toast
-    /// (daemon found but connection rejected).
+    /// switches to daemon mode. Existing GUI sessions are snapshot-only;
+    /// input is forwarded via RPC only for sessions created by this TUI. On
+    /// failure, falls back to standalone silently (no daemon found) or with a
+    /// toast (daemon found but connection rejected).
     pub fn try_connect_daemon(&mut self) {
         use crate::orca_daemon::{DaemonConnectOptions, DaemonError};
         use std::collections::HashMap;
@@ -1736,7 +1872,7 @@ impl<B: Backend> App<B> {
                 let hydrated = self.hydrate_daemon_sessions(&mut client, &session_map);
                 for pane in &self.panes {
                     let sid = pane.daemon_session_id.as_ref();
-                    if let Some(sid) = sid {
+                    if let Some(sid) = sid.filter(|_| !pane.daemon_read_only) {
                         session_map.lock().unwrap().insert(sid.clone(), pane.id());
                     }
                 }
@@ -1806,7 +1942,7 @@ impl<B: Backend> App<B> {
                 self.daemon_backoff =
                     Duration::from_secs(self.config.daemon.reconnect_initial_secs);
                 self.toasts.push(crate::toast::Toast::success(format!(
-                    "Connected to Orca daemon (pid {pid}), {hydrated} 个终端"
+                    "Connected to Orca daemon (pid {pid}), {hydrated} 个终端（已有会话只读）"
                 )));
             }
             Some(Err(e)) => {
@@ -1984,7 +2120,11 @@ impl<B: Backend> App<B> {
                     Arc::new(Mutex::new(HashMap::new()));
                 let hydrated = self.hydrate_daemon_sessions(&mut client, &session_map);
                 for pane in &self.panes {
-                    if let Some(sid) = &pane.daemon_session_id {
+                    if let Some(sid) = pane
+                        .daemon_session_id
+                        .as_ref()
+                        .filter(|_| !pane.daemon_read_only)
+                    {
                         session_map.lock().unwrap().insert(sid.clone(), pane.id());
                     }
                 }
@@ -2046,7 +2186,7 @@ impl<B: Backend> App<B> {
                 self.daemon_backoff =
                     Duration::from_secs(self.config.daemon.reconnect_initial_secs);
                 self.toasts.push(crate::toast::Toast::success(format!(
-                    "Reconnected to Orca daemon (pid {pid}), {hydrated} 个终端"
+                    "Reconnected to Orca daemon (pid {pid}), {hydrated} 个终端（已有会话只读）"
                 )));
             }
             Some(Err(e)) => {
@@ -2126,6 +2266,22 @@ impl<B: Backend> App<B> {
         // workspace name can widen the sidebar enough to remain readable.
         // The helper caps the expansion while preserving a usable pane area.
         let catalog_entries = self.catalog_sidebar_entries();
+        let (workspace_groups, workspace_targets) = self.workspace_sidebar_groups();
+        let use_workspace_sidebar = self.daemon.is_some()
+            || self.workspace_catalog_loaded
+            || !self.workspace_catalog.is_empty();
+        let workspace_width_entries: Vec<crate::sidebar::SidebarEntry> = workspace_groups
+            .iter()
+            .map(|group| crate::sidebar::SidebarEntry {
+                name: group.name.clone(),
+                state: AgentState::Idle,
+                branch: group.detail.clone(),
+                activity: None,
+                focused: false,
+                pinned: false,
+            })
+            .collect();
+        self.sidebar_workspace_targets = workspace_targets;
         self.sidebar_catalog_entries = self
             .workspace_catalog
             .iter()
@@ -2140,12 +2296,23 @@ impl<B: Backend> App<B> {
             .collect();
         let mut render_model =
             RenderModel::from_slots_with_catalog(&self.panes, self.focus, &catalog_entries);
+        // The persistent sidebar is workspace-first. Keep the render model's
+        // sidebar projection aligned with the grouped rows so width/tally
+        // calculations and diagnostics describe the same visible structure.
+        if use_workspace_sidebar {
+            render_model.sidebar_entries = workspace_width_entries.clone();
+        }
 
         // Reserve the left sidebar (Orca-style agent list with status dots +
         // live activity from OSC 9999). Hidden when sidebar_width is 0 or the
         // terminal is too narrow for panes to be usable.
+        let width_entries = if use_workspace_sidebar {
+            &workspace_width_entries
+        } else {
+            &render_model.sidebar_entries
+        };
         let sidebar_w = sidebar::recommended_width(
-            &render_model.sidebar_entries,
+            width_entries,
             self.config.layout.sidebar_width,
             total.width,
             12,
@@ -2162,9 +2329,15 @@ impl<B: Backend> App<B> {
         } else {
             (None, total)
         };
-        self.sidebar_entry_hitboxes = sidebar_area
-            .map(|area| sidebar::entry_hit_rects(area, &render_model.sidebar_entries, true))
-            .unwrap_or_default();
+        self.sidebar_entry_hitboxes = if use_workspace_sidebar {
+            Vec::new()
+        } else {
+            sidebar_area
+                .map(|area| sidebar::entry_hit_rects(area, &render_model.sidebar_entries, true))
+                .unwrap_or_default()
+        };
+        self.sidebar_workspace_hitboxes.clear();
+        self.sidebar_pane_hitboxes.clear();
 
         let reserve_footer = total.height >= 3 && self.config.layout.show_status_bar;
         let (main_area, footer_area) = if reserve_footer {
@@ -2180,9 +2353,27 @@ impl<B: Backend> App<B> {
         let chrome = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(main_area);
         let tab_area = chrome[0];
         let terminal_area = chrome[1];
-        let tab_items: Vec<TabItem> = self
-            .panes
+        // The horizontal strip belongs to the current workspace, not to the
+        // whole daemon inventory. Keep the global pane indexes in a separate
+        // map because tab hit boxes are indexed by this filtered list.
+        let active_workspace_group = if use_workspace_sidebar {
+            workspace_groups.iter().position(|group| {
+                group
+                    .agents
+                    .iter()
+                    .any(|(pane_idx, _)| *pane_idx == self.focus)
+            })
+        } else {
+            None
+        };
+        let tab_pane_indices: Vec<usize> = active_workspace_group
+            .and_then(|group_idx| workspace_groups.get(group_idx))
+            .map(|group| group.agents.iter().map(|(pane_idx, _)| *pane_idx).collect())
+            .unwrap_or_else(|| (0..self.panes.len()).collect());
+        self.tab_pane_indices = tab_pane_indices.clone();
+        let tab_items: Vec<TabItem> = tab_pane_indices
             .iter()
+            .filter_map(|pane_idx| self.panes.get(*pane_idx))
             .map(|slot| TabItem {
                 label: slot.name().to_owned(),
                 status: Some(
@@ -2199,6 +2390,10 @@ impl<B: Backend> App<B> {
                 ),
             })
             .collect();
+        let active_tab = tab_pane_indices
+            .iter()
+            .position(|pane_idx| *pane_idx == self.focus)
+            .unwrap_or(0);
         self.tab_hitboxes = tab_bar::layout_tabs(tab_area, &tab_items);
         self.sidebar_rect = sidebar_area;
         let zoomed = self.zoomed && self.focus < self.panes.len();
@@ -2212,6 +2407,10 @@ impl<B: Backend> App<B> {
         // prevents PTY dimensions from being derived from a split grid and
         // makes fullscreen TUIs behave like a genuine terminal.
         let mut daemon_resize = None;
+        let focused_daemon_read_only = self
+            .panes
+            .get(self.focus)
+            .is_some_and(|slot| slot.daemon_read_only);
         if let Some(pane) = self.panes.get_mut(self.focus) {
             let rect = terminal_area;
             let inner_w = rect.width.saturating_sub(2).max(MIN_COLS);
@@ -2246,8 +2445,10 @@ impl<B: Backend> App<B> {
                             );
                         }
                     }
-                } else if let Some(session_id) = pane.daemon_session_id.clone() {
-                    daemon_resize = Some((session_id, inner_w, inner_h));
+                } else if !focused_daemon_read_only {
+                    if let Some(session_id) = pane.daemon_session_id.clone() {
+                        daemon_resize = Some((session_id, inner_w, inner_h));
+                    }
                 }
             }
         }
@@ -2461,6 +2662,7 @@ impl<B: Backend> App<B> {
             None
         };
         let footer_quit_hitbox = self.footer_quit_hitbox;
+        let mut workspace_hitboxes = crate::sidebar::WorkspaceSidebarHitboxes::default();
         self.terminal.draw(|f| {
             if let Some(sb) = sidebar_area {
                 let conn_status = match self.conn_state {
@@ -2468,7 +2670,24 @@ impl<B: Backend> App<B> {
                     ConnectionState::Connected => Some(("● Daemon", theme.success())),
                     ConnectionState::Disconnected { .. } => Some(("✗ Disconnected", theme.error())),
                 };
-                sidebar::render_sidebar(f, sb, &render_model.sidebar_entries, theme, conn_status);
+                if use_workspace_sidebar {
+                    workspace_hitboxes = sidebar::render_workspace_sidebar(
+                        f,
+                        sb,
+                        &workspace_groups,
+                        theme,
+                        conn_status,
+                        panes.len(),
+                    );
+                } else {
+                    sidebar::render_sidebar(
+                        f,
+                        sb,
+                        &render_model.sidebar_entries,
+                        theme,
+                        conn_status,
+                    );
+                }
                 // Fill the gap between sidebar and panes with the theme bg so it
                 // isn't a terminal-default strip (background everywhere).
                 let gw = content_area.x.saturating_sub(sb.right());
@@ -2478,7 +2697,7 @@ impl<B: Backend> App<B> {
                         .set_style(gap, Style::default().bg(theme.bg()));
                 }
             }
-            let _ = tab_bar::render_tab_bar(f, tab_area, &tab_items, focus, theme);
+            let _ = tab_bar::render_tab_bar(f, tab_area, &tab_items, active_tab, theme);
             if let Some(pane) = panes.get_mut(focus) {
                 pane.render(f, terminal_area, true, theme);
             }
@@ -2826,6 +3045,7 @@ impl<B: Backend> App<B> {
                     )]),
                     Line::from("  Ctrl+Alt+P  Enter Pane mode"),
                     Line::from("  Ctrl+Q    Quit"),
+                    Line::from("  click tab ×  Close that terminal tab"),
                     Line::from("  scroll    Scroll focused pane"),
                     Line::raw(""),
                     Line::from(vec![Span::styled(
@@ -3070,6 +3290,10 @@ impl<B: Backend> App<B> {
                 self.toasts.render_buf(f.buffer_mut(), toast_area, theme);
             }
         })?;
+        if use_workspace_sidebar {
+            self.sidebar_workspace_hitboxes = workspace_hitboxes.workspaces;
+            self.sidebar_pane_hitboxes = workspace_hitboxes.panes;
+        }
 
         Ok(())
     }
@@ -3685,14 +3909,56 @@ impl<B: Backend> App<B> {
                     self.drag_origin = None;
                     return;
                 }
+                // A close affordance is nested inside its tab, so test it
+                // before the broader tab hitboxes. Resolve the filtered tab
+                // index through `tab_pane_indices` before removing anything;
+                // workspace-scoped strips must never close a pane from another
+                // workspace just because vector positions differ.
+                if let Some(tab_idx) = self
+                    .tab_hitboxes
+                    .closes
+                    .iter()
+                    .position(|rect| rect.is_some_and(|r| contains(r, col, row)))
+                {
+                    if let Some(&pane_idx) = self.tab_pane_indices.get(tab_idx) {
+                        if pane_idx < self.panes.len() {
+                            // Prefer the neighboring tab from this same
+                            // filtered strip. A plain global-index clamp can
+                            // move focus into another workspace when the
+                            // closed tab was followed by an unrelated pane.
+                            let neighbor = if tab_idx > 0 {
+                                self.tab_pane_indices.get(tab_idx - 1).copied()
+                            } else {
+                                self.tab_pane_indices.get(tab_idx + 1).copied()
+                            };
+                            self.focus = pane_idx;
+                            self.close_focused_pane();
+                            if let Some(mut neighbor) = neighbor {
+                                // Removing a pane shifts every later global
+                                // index one slot to the left.
+                                if neighbor > pane_idx {
+                                    neighbor = neighbor.saturating_sub(1);
+                                }
+                                if neighbor < self.panes.len() {
+                                    self.focus = neighbor;
+                                }
+                            }
+                        }
+                    }
+                    self.mode = InputMode::Normal;
+                    self.drag_origin = None;
+                    return;
+                }
                 if let Some(idx) = self
                     .tab_hitboxes
                     .tabs
                     .iter()
                     .position(|r| contains(*r, col, row))
                 {
-                    if idx < self.panes.len() {
-                        self.focus = idx;
+                    if let Some(&pane_idx) = self.tab_pane_indices.get(idx) {
+                        if pane_idx < self.panes.len() {
+                            self.focus = pane_idx;
+                        }
                         self.mode = InputMode::Normal;
                     }
                     self.drag_origin = None;
@@ -3718,6 +3984,66 @@ impl<B: Backend> App<B> {
                 }
                 if let Some(sidebar) = self.sidebar_rect {
                     if contains(sidebar, col, row) {
+                        // Workspace-first sidebar: child terminal rows focus
+                        // an existing pane; clicking a workspace focuses its
+                        // existing terminal or lazily opens a local checkout.
+                        if let Some(pane_idx) = self
+                            .sidebar_pane_hitboxes
+                            .iter()
+                            .position(|rect| rect.is_some_and(|rect| contains(rect, col, row)))
+                        {
+                            if pane_idx < self.panes.len() {
+                                self.focus = pane_idx;
+                                self.mode = InputMode::Normal;
+                                self.drag_origin = None;
+                                return;
+                            }
+                        }
+                        if let Some(group_idx) = self
+                            .sidebar_workspace_hitboxes
+                            .iter()
+                            .position(|rect| rect.is_some_and(|rect| contains(rect, col, row)))
+                        {
+                            if let Some(workspace) = self
+                                .sidebar_workspace_targets
+                                .get(group_idx)
+                                .and_then(Option::as_ref)
+                                .cloned()
+                            {
+                                if let Some(pane_idx) = self.panes.iter().position(|slot| {
+                                    slot.workspace_id.as_deref() == Some(workspace.id.as_str())
+                                        || slot.worktree_path.as_ref() == Some(&workspace.path)
+                                }) {
+                                    self.focus = pane_idx;
+                                } else if workspace.is_local() && self.can_spawn_pane() {
+                                    let command = self
+                                        .panes
+                                        .get(self.focus)
+                                        .map(|slot| slot.command.clone())
+                                        .filter(|command| !command.is_empty())
+                                        .unwrap_or_else(|| {
+                                            let agent = if self.config.default_agent.is_empty() {
+                                                "bash"
+                                            } else {
+                                                self.config.default_agent.as_str()
+                                            };
+                                            vec![agent.to_owned()]
+                                        });
+                                    let mut spec = AgentSpec::from_command(command);
+                                    spec.name = workspace.sidebar_name();
+                                    spec.worktree_branch = Some(workspace.branch.clone());
+                                    spec.workspace_id = Some(workspace.id.clone());
+                                    spec.worktree = Some(workspace.path.clone());
+                                    self.focus = self.spawn_one(spec);
+                                }
+                            }
+                            self.mode = InputMode::Normal;
+                            self.drag_origin = None;
+                            return;
+                        }
+                        // Compatibility hit boxes are retained for the old
+                        // flat renderer and for tests that construct panes
+                        // without a workspace catalog.
                         if let Some(entry_idx) = self
                             .sidebar_entry_hitboxes
                             .iter()
@@ -3902,10 +4228,29 @@ impl<B: Backend> App<B> {
         if self.panes.is_empty() {
             return;
         }
-        if self.focus >= self.panes.len() {
-            self.focus = 0;
+        // In workspace mode, cycle only through the tabs rendered for the
+        // active workspace. Fall back to the complete pane list before the
+        // first frame (or if the cached map became stale after a close).
+        let scoped = self
+            .tab_pane_indices
+            .iter()
+            .copied()
+            .filter(|idx| *idx < self.panes.len())
+            .collect::<Vec<_>>();
+        let indices: &[usize] = if !scoped.is_empty() && scoped.contains(&self.focus) {
+            &scoped
         } else {
-            self.focus = (self.focus + 1) % self.panes.len();
+            // This local array cannot be borrowed as a slice alongside the
+            // branch above, so handle the fallback directly.
+            if self.focus >= self.panes.len() {
+                self.focus = 0;
+            } else {
+                self.focus = (self.focus + 1) % self.panes.len();
+            }
+            return;
+        };
+        if let Some(position) = indices.iter().position(|idx| *idx == self.focus) {
+            self.focus = indices[(position + 1) % indices.len()];
         }
     }
 
@@ -3914,11 +4259,23 @@ impl<B: Backend> App<B> {
         if self.panes.is_empty() {
             return;
         }
-        self.focus = if self.focus == 0 {
-            self.panes.len() - 1
+        let scoped = self
+            .tab_pane_indices
+            .iter()
+            .copied()
+            .filter(|idx| *idx < self.panes.len())
+            .collect::<Vec<_>>();
+        if !scoped.is_empty() && scoped.contains(&self.focus) {
+            if let Some(position) = scoped.iter().position(|idx| *idx == self.focus) {
+                self.focus = scoped[(position + scoped.len() - 1) % scoped.len()];
+            }
         } else {
-            self.focus - 1
-        };
+            self.focus = if self.focus == 0 {
+                self.panes.len() - 1
+            } else {
+                self.focus - 1
+            };
+        }
     }
 
     /// Build the list of spawnable agents for the Ctrl+N picker.
@@ -4033,23 +4390,35 @@ impl<B: Backend> App<B> {
         }
         let idx = self.focus;
         // `x` is the explicit close/kill action. For a local pane this kills
-        // its PTY; for an Orca-backed pane it sends the daemon's `kill` RPC.
-        // The global Ctrl+Q / `× 退出` path never calls this method and thus
-        // only disconnects the viewer, preserving daemon sessions.
-        if let Some(session) = self.panes[idx].session.as_mut() {
-            let _ = session.kill();
-        }
-        if let Some(session_id) = self.panes[idx].daemon_session_id.clone() {
-            if let Some(daemon) = self.daemon.as_mut() {
-                daemon.enqueue_kill(session_id.clone());
+        // its PTY; for a TUI-owned Orca pane it sends the daemon's `kill` RPC.
+        // A read-only snapshot pane has no TUI-owned PTY, so this only drops
+        // the local view. The global Ctrl+Q / `× 退出` path never calls this
+        // method and thus only disconnects the viewer, preserving sessions.
+        if !self.panes[idx].daemon_read_only {
+            if let Some(session) = self.panes[idx].session.as_mut() {
+                let _ = session.kill();
             }
-            if let Some(session_map) = &self.daemon_session_map {
-                session_map.lock().unwrap().remove(&session_id);
+            if let Some(session_id) = self.panes[idx].daemon_session_id.clone() {
+                if let Some(daemon) = self.daemon.as_mut() {
+                    daemon.enqueue_kill(session_id.clone());
+                }
+                if let Some(session_map) = &self.daemon_session_map {
+                    session_map.lock().unwrap().remove(&session_id);
+                }
             }
         }
         // Dropping one slot removes the PTY and every item of pane-owned state
         // atomically; there are no sibling vectors to keep in lockstep.
         self.panes.remove(idx);
+        // Keep the cached workspace-scoped tab projection coherent until the
+        // next render rebuilds its hitboxes. This matters when a close key is
+        // followed immediately by Tab/Shift+Tab in the same event cycle.
+        self.tab_pane_indices.retain(|pane_idx| *pane_idx != idx);
+        for pane_idx in &mut self.tab_pane_indices {
+            if *pane_idx > idx {
+                *pane_idx = pane_idx.saturating_sub(1);
+            }
+        }
         // Adjust focus to the previous pane (or wrap to the last).
         if self.panes.is_empty() {
             self.mode = InputMode::Normal;
@@ -4072,12 +4441,18 @@ impl<B: Backend> App<B> {
     /// agent's PTY write will error and we swallow it rather than tear down the
     /// whole TUI (typing into a finished pane is a no-op).
     ///
-    /// In daemon mode: sends a `write` RPC to the daemon (the daemon owns the
-    /// PTY). If the RPC fails (daemon crash, session gone), a toast is pushed
-    /// so the user sees what happened — the typed bytes are lost (no local PTY
-    /// to fall back to in daemon mode).
+    /// In daemon mode, sends a `write` RPC only for a session owned by this
+    /// TUI. Existing Orca GUI sessions are read-only snapshots; forwarding
+    /// their input would mutate the GUI session without owning its stream.
     fn send_to_focused(&mut self, bytes: &[u8]) {
         if let Some(daemon) = &mut self.daemon {
+            if self
+                .panes
+                .get(self.focus)
+                .is_some_and(|slot| slot.daemon_read_only)
+            {
+                return;
+            }
             // Daemon mode: forward via RPC using the pane's daemon session ID.
             let session_id = match self
                 .panes
@@ -4273,10 +4648,14 @@ mod tests {
                 activity: ActivityLog::new(),
                 pane_rects: Vec::new(),
                 tab_hitboxes: TabHitboxes::default(),
+                tab_pane_indices: Vec::new(),
                 footer_quit_hitbox: None,
                 sidebar_rect: None,
                 sidebar_entry_hitboxes: Vec::new(),
                 sidebar_catalog_entries: Vec::new(),
+                sidebar_workspace_hitboxes: Vec::new(),
+                sidebar_pane_hitboxes: Vec::new(),
+                sidebar_workspace_targets: Vec::new(),
                 launch_cwd: std::env::current_dir().unwrap_or_default(),
                 debug_last_sidebar_signature: None,
                 next_pane_id: 0,
@@ -4927,6 +5306,10 @@ mod tests {
         let text = buffer_text(&app);
         assert!(text.contains("alpha"), "active tab label is visible");
         assert!(text.contains("beta"), "inactive tab label is visible");
+        assert!(
+            text.contains("×"),
+            "each sufficiently wide tab exposes close affordance"
+        );
         assert!(text.contains("active-output"), "active terminal is painted");
         assert!(
             !text.contains("inactive-output"),
@@ -4952,6 +5335,153 @@ mod tests {
         });
         assert_eq!(app.focus, 1);
         assert_eq!(app.mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn mouse_click_tab_close_removes_selected_pane() {
+        let mut app = App::for_test(vec![pane(0, "alpha"), pane(1, "beta"), pane(2, "gamma")]);
+        app.render().expect("initial tab render");
+        let close = app.tab_hitboxes.closes[1].expect("second tab is wide enough to close");
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: close.x,
+            row: close.y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.panes.len(), 2, "close removes exactly one pane");
+        assert_eq!(app.panes[0].name(), "alpha");
+        assert_eq!(app.panes[1].name(), "gamma");
+        assert_eq!(app.tab_pane_indices, vec![0, 1]);
+        assert_eq!(app.focus, 0, "focus lands on the previous surviving pane");
+        assert_eq!(app.mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn workspace_tabs_only_show_and_select_panes_in_focused_workspace() {
+        let mut app = App::for_test(vec![
+            pane(0, "alpha"),
+            pane(1, "other-workspace"),
+            pane(2, "beta"),
+        ]);
+        let workspace = |id: &str, path: &str, branch: &str| OrcaWorkspace {
+            id: id.to_owned(),
+            path: PathBuf::from(path),
+            branch: branch.to_owned(),
+            display_name: branch.to_owned(),
+            repo_id: id.to_owned(),
+            project_id: None,
+            host_id: Some("local".to_owned()),
+            catalog_source_host_id: None,
+            is_archived: false,
+            workspace_status: None,
+            is_main_worktree: false,
+        };
+        app.workspace_catalog = vec![
+            workspace("workspace-a", "/workspace-a", "main"),
+            workspace("workspace-b", "/workspace-b", "feature"),
+        ];
+        app.workspace_catalog_loaded = true;
+        app.panes[0].workspace_id = Some("workspace-a".to_owned());
+        app.panes[1].workspace_id = Some("workspace-b".to_owned());
+        app.panes[2].workspace_id = Some("workspace-a".to_owned());
+        app.focus = 0;
+
+        app.render().expect("render workspace-scoped tabs");
+        assert_eq!(app.tab_pane_indices, vec![0, 2]);
+        assert_eq!(app.tab_hitboxes.tabs.len(), 2);
+
+        let second_tab = app.tab_hitboxes.tabs[1];
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: second_tab.x + 1,
+            row: second_tab.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.focus, 2,
+            "tab click maps filtered position to pane index"
+        );
+
+        app.focus = 0;
+        app.focus_next();
+        assert_eq!(app.focus, 2, "next tab stays in workspace-a");
+        app.focus_next();
+        assert_eq!(app.focus, 0, "next tab wraps within workspace-a");
+        app.focus_prev();
+        assert_eq!(app.focus, 2, "previous tab stays in workspace-a");
+    }
+
+    #[test]
+    fn workspace_tab_close_maps_filtered_tab_to_the_correct_global_pane() {
+        let mut app = App::for_test(vec![
+            pane(0, "alpha"),
+            pane(1, "other-workspace"),
+            pane(2, "beta"),
+        ]);
+        let workspace = |id: &str, path: &str, branch: &str| OrcaWorkspace {
+            id: id.to_owned(),
+            path: PathBuf::from(path),
+            branch: branch.to_owned(),
+            display_name: branch.to_owned(),
+            repo_id: id.to_owned(),
+            project_id: None,
+            host_id: Some("local".to_owned()),
+            catalog_source_host_id: None,
+            is_archived: false,
+            workspace_status: None,
+            is_main_worktree: false,
+        };
+        app.workspace_catalog = vec![
+            workspace("workspace-a", "/workspace-a", "main"),
+            workspace("workspace-b", "/workspace-b", "feature"),
+        ];
+        app.workspace_catalog_loaded = true;
+        app.panes[0].workspace_id = Some("workspace-a".to_owned());
+        app.panes[1].workspace_id = Some("workspace-b".to_owned());
+        app.panes[2].workspace_id = Some("workspace-a".to_owned());
+        app.focus = 0;
+        app.render().expect("render workspace-scoped tabs");
+
+        let close = app.tab_hitboxes.closes[1].expect("second workspace tab can close");
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: close.x,
+            row: close.y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(
+            app.panes.iter().map(|pane| pane.name()).collect::<Vec<_>>(),
+            vec!["alpha", "other-workspace"]
+        );
+        assert_eq!(app.tab_pane_indices, vec![0]);
+        assert_eq!(
+            app.focus, 0,
+            "closing workspace-a's second tab keeps alpha focused"
+        );
+    }
+
+    #[test]
+    fn closing_read_only_daemon_tab_only_removes_tui_view() {
+        let mut app = App::for_test(vec![pane(0, "orca-session")]);
+        app.panes[0].daemon_session_id = Some("session-1".to_owned());
+        app.panes[0].daemon_read_only = true;
+        app.render().expect("render read-only daemon tab");
+        let close = app.tab_hitboxes.closes[0].expect("daemon tab close affordance");
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: close.x,
+            row: close.y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(
+            app.panes.is_empty(),
+            "read-only tab can be dismissed locally"
+        );
+        assert!(app.daemon_session_map.is_none());
     }
 
     #[test]
@@ -5357,6 +5887,76 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].branch.as_deref(), Some("main @ runtime:env-1"));
+    }
+
+    #[test]
+    fn workspace_sidebar_groups_catalog_rows_and_child_terminals() {
+        let mut app = App::for_test(vec![pane(0, "build")]);
+        app.panes[0].workspace_id = Some("repo-a::/main".to_owned());
+        app.workspace_catalog = vec![
+            OrcaWorkspace {
+                id: "repo-a::/main".to_owned(),
+                path: PathBuf::from("/main"),
+                branch: "main".to_owned(),
+                display_name: "main".to_owned(),
+                repo_id: "repo-a".to_owned(),
+                project_id: Some("github:org/repo-a".to_owned()),
+                host_id: Some("local".to_owned()),
+                catalog_source_host_id: None,
+                is_archived: false,
+                workspace_status: None,
+                is_main_worktree: true,
+            },
+            OrcaWorkspace {
+                id: "repo-b::/feature".to_owned(),
+                path: PathBuf::from("/feature"),
+                branch: "feature".to_owned(),
+                display_name: "feature".to_owned(),
+                repo_id: "repo-b".to_owned(),
+                project_id: None,
+                host_id: Some("local".to_owned()),
+                catalog_source_host_id: None,
+                is_archived: false,
+                workspace_status: None,
+                is_main_worktree: false,
+            },
+        ];
+        let (groups, targets) = app.workspace_sidebar_groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].name, "repo-a/main");
+        assert_eq!(groups[0].agents.len(), 1);
+        assert_eq!(groups[0].agents[0].0, 0);
+        assert_eq!(groups[1].name, "repo-b/feature");
+        assert!(groups[1].agents.is_empty());
+        assert_eq!(
+            targets[0].as_ref().map(|w| w.id.as_str()),
+            Some("repo-a::/main")
+        );
+    }
+
+    #[test]
+    fn workspace_sidebar_render_uses_workspace_title() {
+        let mut app = App::for_test(vec![pane(0, "build")]);
+        app.workspace_catalog_loaded = true;
+        app.workspace_catalog = vec![OrcaWorkspace {
+            id: "repo-a::/main".to_owned(),
+            path: PathBuf::from("/main"),
+            branch: "main".to_owned(),
+            display_name: "main".to_owned(),
+            repo_id: "repo-a".to_owned(),
+            project_id: Some("github:org/repo-a".to_owned()),
+            host_id: Some("local".to_owned()),
+            catalog_source_host_id: None,
+            is_archived: false,
+            workspace_status: None,
+            is_main_worktree: true,
+        }];
+        app.panes[0].workspace_id = Some("repo-a::/main".to_owned());
+        app.render().expect("render workspace sidebar");
+        let text = buffer_text(&app);
+        assert!(text.contains("WORKSPACES"));
+        assert!(text.contains("repo-a/main"));
+        assert!(!text.contains("IN PROGRESS"));
     }
 
     #[test]

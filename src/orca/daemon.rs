@@ -3,7 +3,9 @@
 //! Orca GUI runs a background daemon (`src/main/daemon/`) that manages agent
 //! PTYs, headless terminal emulators, and session history. This module lets
 //! orcatui connect to that daemon as a TUI client — giving it session
-//! persistence, structured agent status, and multi-client (GUI + TUI) support.
+//! persistence and structured agent status. Existing GUI sessions are read
+//! through `getSnapshot`; Orca v36's `createOrAttach` endpoint takes ownership
+//! of a session, so it is reserved for sessions created by this TUI.
 //!
 //! ## Protocol (from the open-source daemon code)
 //!
@@ -615,22 +617,15 @@ impl DaemonClient {
         self.rpc("listSessions", serde_json::json!({}))
     }
 
-    /// Attach this client to an existing session without creating a new PTY.
-    /// The returned payload contains the daemon's current ANSI snapshot.
-    pub fn attach_session(
-        &mut self,
-        session_id: &str,
-        cols: u16,
-        rows: u16,
-    ) -> Result<serde_json::Value, DaemonError> {
+    /// Read a session snapshot without attaching a stream client.
+    ///
+    /// `createOrAttach(attachOnly)` is not a passive operation on Orca v36:
+    /// it detaches the GUI client before attaching the caller. Keep this
+    /// read-only path separate so inventory viewers cannot steal GUI input.
+    pub fn snapshot_session(&mut self, session_id: &str) -> Result<serde_json::Value, DaemonError> {
         self.rpc(
-            "createOrAttach",
-            serde_json::json!({
-                "sessionId": session_id,
-                "cols": cols,
-                "rows": rows,
-                "attachOnly": true,
-            }),
+            "getSnapshot",
+            serde_json::json!({ "sessionId": session_id }),
         )
     }
 
@@ -1145,6 +1140,38 @@ mod tests {
         let sessions = result.unwrap();
         assert!(sessions["sessions"].is_array());
         assert_eq!(sessions["sessions"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn snapshot_session_uses_read_only_get_snapshot_rpc() {
+        let (mut client, mut server) = make_test_client();
+        std::thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            let mut line = Vec::new();
+            loop {
+                match server.read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                        line.push(byte[0]);
+                    }
+                    Err(_) => break,
+                }
+            }
+            let request: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(request["type"], "getSnapshot");
+            assert_eq!(request["payload"]["sessionId"], "session-a");
+            server
+                .write_all(
+                    br#"{"id":"rpc-1","ok":true,"payload":{"snapshot":{"snapshotAnsi":"safe"}},"error":null}
+"#,
+                )
+                .unwrap();
+        });
+        let payload = client.snapshot_session("session-a").unwrap();
+        assert_eq!(payload["snapshot"]["snapshotAnsi"], "safe");
     }
 
     #[test]

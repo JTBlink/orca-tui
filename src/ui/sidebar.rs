@@ -52,6 +52,31 @@ pub struct SidebarEntry {
     pub pinned: bool,
 }
 
+/// A workspace row in the Orca-style project sidebar. Workspaces are the
+/// primary navigation target; live terminal panes are rendered as indented
+/// children beneath their owning workspace.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSidebarGroup {
+    /// Stable workspace id when this row came from Orca's catalog.
+    pub id: Option<String>,
+    /// User-facing workspace/project name.
+    pub name: String,
+    /// Optional branch/host detail shown on the workspace row.
+    pub detail: Option<String>,
+    /// Live panes belonging to this workspace. The usize is the pane index in
+    /// the app's stable pane vector and is used for mouse hit testing.
+    pub agents: Vec<(usize, SidebarEntry)>,
+}
+
+/// Hit boxes produced by [`render_workspace_sidebar`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceSidebarHitboxes {
+    /// One optional row hit box per workspace group.
+    pub workspaces: Vec<Option<Rect>>,
+    /// One optional child hit box per pane index.
+    pub panes: Vec<Option<Rect>>,
+}
+
 /// Recommend a sidebar width that keeps the longest workspace/agent label
 /// readable while reserving a usable pane area on the right. The configured
 /// width is the preferred size; narrow terminals may shrink it to the compact
@@ -104,6 +129,166 @@ fn visible_branch(entry: &SidebarEntry) -> Option<&str> {
         .strip_suffix(branch)
         .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('/'));
     (!redundant).then_some(branch)
+}
+
+/// Render the persistent workspace navigation used by the main Orca TUI.
+///
+/// The old [`render_sidebar`] remains available for the standalone agent list
+/// and its focused unit tests. Orca's desktop surface is workspace-first, so
+/// the main view uses this grouped variant: one row per workspace followed by
+/// indented live terminal rows. Empty workspaces remain visible and can be
+/// clicked to lazily create a terminal when the caller permits it.
+pub fn render_workspace_sidebar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    groups: &[WorkspaceSidebarGroup],
+    theme: &ThemeConfig,
+    status: Option<(&str, Color)>,
+    pane_count: usize,
+) -> WorkspaceSidebarHitboxes {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border()))
+        .style(Style::default().bg(theme.panel()))
+        .title(Line::from(" WORKSPACES ").style(Style::default().fg(theme.accent())));
+    let inner = block.inner(area);
+    frame.render_widget(&block, area);
+    let buf = frame.buffer_mut();
+    buf.set_style(area, Style::default().bg(theme.panel()));
+
+    let mut hit = WorkspaceSidebarHitboxes {
+        workspaces: vec![None; groups.len()],
+        panes: vec![None; pane_count],
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return hit;
+    }
+    let bottom = inner.bottom();
+    let mut y = inner.y;
+    if let Some((label, color)) = status {
+        if y < bottom {
+            let _ = buf.set_stringn(
+                inner.x,
+                y,
+                label,
+                usize::from(inner.width),
+                Style::default()
+                    .fg(color)
+                    .bg(theme.panel())
+                    .add_modifier(Modifier::DIM),
+            );
+        }
+        y = y.saturating_add(1);
+    }
+    if y < bottom {
+        let label = format!(" PROJECTS ({}) ", groups.len());
+        let _ = buf.set_stringn(
+            inner.x,
+            y,
+            &label,
+            usize::from(inner.width),
+            Style::default()
+                .fg(theme.fg())
+                .bg(theme.panel())
+                .add_modifier(Modifier::DIM),
+        );
+        y = y.saturating_add(1);
+    }
+
+    // Keep the footer summary visible when the panel is tall enough. Rows are
+    // windowed from the top in the same deterministic order as Orca's catalog.
+    let summary = inner.height >= 8;
+    let content_bottom = if summary {
+        bottom.saturating_sub(1)
+    } else {
+        bottom
+    };
+    for (group_idx, group) in groups.iter().enumerate() {
+        if y >= content_bottom {
+            break;
+        }
+        let group_row = Rect::new(inner.x, y, inner.width, 1);
+        hit.workspaces[group_idx] = Some(group_row);
+        buf.set_style(group_row, Style::default().bg(theme.panel()));
+        let marker = if group.agents.is_empty() {
+            "○"
+        } else {
+            "▾"
+        };
+        let mut label = format!("{marker} {}", group.name);
+        if let Some(detail) = group.detail.as_deref().filter(|s| !s.is_empty()) {
+            label.push_str(" · ");
+            label.push_str(detail);
+        }
+        let _ = buf.set_stringn(
+            inner.x,
+            y,
+            &label,
+            usize::from(inner.width),
+            Style::default()
+                .fg(theme.fg())
+                .bg(theme.panel())
+                .add_modifier(Modifier::BOLD),
+        );
+        y = y.saturating_add(1);
+
+        for (pane_idx, entry) in &group.agents {
+            if y >= content_bottom {
+                break;
+            }
+            let row = Rect::new(inner.x, y, inner.width, 1);
+            if let Some(slot) = hit.panes.get_mut(*pane_idx) {
+                *slot = Some(row);
+            }
+            // Reuse the status/activity renderer while reserving two cells for
+            // the workspace tree indentation. A narrow sidebar still retains
+            // the complete workspace hierarchy rather than reverting to a
+            // flat agent list.
+            let indent = 2u16.min(inner.width);
+            if indent > 0 {
+                let _ = buf.set_stringn(
+                    inner.x,
+                    y,
+                    "  ",
+                    usize::from(indent),
+                    Style::default().bg(theme.panel()),
+                );
+            }
+            render_entry_row(
+                buf,
+                inner.x.saturating_add(indent),
+                y,
+                inner.width.saturating_sub(indent),
+                entry,
+                theme,
+            );
+            y = y.saturating_add(1);
+        }
+    }
+    if summary && bottom > inner.y {
+        let agent_total = groups.iter().map(|group| group.agents.len()).sum::<usize>();
+        let text = format!(
+            " {} workspace{} · {} terminal{}",
+            groups.len(),
+            if groups.len() == 1 { "" } else { "s" },
+            agent_total,
+            if agent_total == 1 { "" } else { "s" }
+        );
+        let row = Rect::new(inner.x, bottom.saturating_sub(1), inner.width, 1);
+        buf.set_style(row, Style::default().bg(theme.panel()));
+        let _ = buf.set_stringn(
+            row.x,
+            row.y,
+            &text,
+            usize::from(row.width),
+            Style::default()
+                .fg(theme.muted())
+                .bg(theme.panel())
+                .add_modifier(Modifier::DIM),
+        );
+    }
+    hit
 }
 
 /// Render the sidebar into a region of `frame`.

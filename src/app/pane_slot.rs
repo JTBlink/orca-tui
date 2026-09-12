@@ -25,6 +25,11 @@ pub(crate) struct PaneSlot {
     pub(crate) worktree_path: Option<PathBuf>,
     pub(crate) task: Option<TaskId>,
     pub(crate) daemon_session_id: Option<String>,
+    /// Existing Orca sessions are hydrated through the read-only snapshot
+    /// RPC. They must never receive input or resize/kill requests from the
+    /// TUI, because Orca's createOrAttach endpoint replaces the GUI's
+    /// attachment owner.
+    pub(crate) daemon_read_only: bool,
     pub(crate) reconnect: Option<ReconnectSession>,
     pub(crate) reconnect_due: Option<Instant>,
     pub(crate) pinned: bool,
@@ -57,6 +62,7 @@ impl PaneSlot {
             worktree_path: None,
             task: None,
             daemon_session_id: None,
+            daemon_read_only: false,
             reconnect: None,
             reconnect_due: None,
             pinned: false,
@@ -73,6 +79,7 @@ impl std::fmt::Debug for PaneSlot {
             .field("command_len", &self.command.len())
             .field("has_task", &self.task.is_some())
             .field("has_daemon_session", &self.daemon_session_id.is_some())
+            .field("daemon_read_only", &self.daemon_read_only)
             .field("reconnect", &self.reconnect.is_some())
             .field("reconnect_due", &self.reconnect_due)
             .field("pinned", &self.pinned)
@@ -96,6 +103,7 @@ mod tests {
         assert!(slot.session.is_none());
         assert!(slot.task.is_none());
         assert!(slot.daemon_session_id.is_none());
+        assert!(!slot.daemon_read_only);
         assert!(slot.reconnect.is_none());
         assert!(slot.reconnect_due.is_none());
         assert!(!slot.pinned);

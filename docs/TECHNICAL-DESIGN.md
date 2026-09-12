@@ -104,12 +104,13 @@ daemon 持有 PTY，attach 客户端断开不影响 Agent。默认 socket 是
 带 token、`clientId` 和 role 的 hello；control 与 stream 的 `daemonIdentity` 必须对应同一
 daemon 实例。发现逻辑查找 Orca 的 versioned `daemon-v36.sock` / token，并兼容旧布局。
 
-连接完成后先调用 `listSessions`，过滤 `isAlive=false` 的记录；每个 live session 使用
-`createOrAttach` 且设置 `attachOnly=true`，把 `scrollbackAnsi + rehydrateSequences +
-snapshotAnsi` 注入对应 tab 的终端模拟器。启动阶段只 hydrate Orca 已有终端，不会因 CLI
-参数隐式创建 agent；tab 栏 `+`、`n` 或自定义命令入口才触发显式 `createOrAttach`。随后将
-stream 事件按 session ID 路由，输入和 resize 通过 daemon RPC 发回，PTY 生命周期始终由
-Orca daemon 管理。由于 daemon `listSessions` 只提供 PTY 状态，启动/重连时另行读取
+连接完成后先调用 `listSessions`，过滤 `isAlive=false` 的记录；已有 live session 使用只读
+`getSnapshot`，把 `scrollbackAnsi + rehydrateSequences + snapshotAnsi` 注入对应 tab 的终端
+模拟器。不能把 `createOrAttach(attachOnly=true)` 当成只读操作：Orca v36 会先
+`detachAllClients()`，再把调用方设为新的 attachment，从而抢走 GUI 输入。已有会话在 TUI 中
+因此不发送输入、resize 或 kill；只有 tab 栏 `+`、`n` 或自定义命令入口显式创建的新会话才触发
+`createOrAttach`，并由 TUI 持有其 attachment。随后将新会话的 stream 事件按 session ID 路由，
+PTY 生命周期始终由 Orca daemon 管理。由于 daemon `listSessions` 只提供 PTY 状态，启动/重连时另行读取
 `orca terminal list --include-visual-layouts --json`，按稳定 `ptyId` 合并 Orca 的标题、
 `agentIdentity` 和视觉顺序；匹配不到的 live session 仍保留，但使用 daemon 的安全回退标签，
 并写入脱敏诊断计数。关闭 tab/退出 TUI 默认只断开当前展示客户端，不杀掉 Orca 会话。
@@ -192,13 +193,15 @@ tab 的单个终端 surface：
 
 ```text
 ┌──────────────┬──────────────────────────────────────┐
-│ workspaces   │ [● tab-1] [○ tab-2] [+]              │
+│ workspaces   │ [● tab-1 ×] [○ tab-2 ×] [+]         │
 │              ├──────────────────────────────────────┤
 │              │ 当前活动 tab 的完整 PTY 终端          │
 └──────────────┴──────────────────────────────────────┘
 ```
 
 tab 只是视图选择器；所有 tab 复用同一个 TUI 终端 surface，后端会话由 `PaneSlot` 持续消费，
-切回时直接显示最新状态。鼠标点击 tab、`+` 或左侧 workspace 均可导航；普通模式下 `Tab` /
-`Shift+Tab` 也会循环切换 tab。这样终端尺寸按整个内容区同步给活动 PTY，不再按 split pane
+切回时直接显示最新状态。横向 tab 只投影当前焦点工作区的终端；鼠标点击 tab、`+` 或左侧
+workspace 均可导航，点击 tab 右侧 `×` 可关闭当前 TUI tab（只读 Orca tab 仅移除本地视图，
+不会发送 kill）；普通模式下 `Tab` / `Shift+Tab` 也只在该工作区内循环切换 tab。这样终端
+尺寸按整个内容区同步给活动 PTY，不再按 split pane
 网格缩小，fullscreen TUI 与真实当前终端的行为保持一致。

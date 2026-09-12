@@ -65,14 +65,12 @@ impl DaemonConnection {
             .map_err(|err| DaemonError::Protocol(format!("invalid listSessions payload: {err}")))
     }
 
-    /// Attach to an existing daemon session and return its current snapshot.
-    pub(crate) fn attach_session(
+    /// Read an existing session without replacing Orca GUI's attachment.
+    pub(crate) fn snapshot_session(
         &mut self,
         session_id: &str,
-        cols: u16,
-        rows: u16,
     ) -> Result<serde_json::Value, DaemonError> {
-        self.client.attach_session(session_id, cols, rows)
+        self.client.snapshot_session(session_id)
     }
 
     /// Read the daemon's best-effort foreground process name. This is used
