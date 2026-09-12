@@ -126,8 +126,9 @@ orca-tui run --daemon
 客户端会自动查找 Orca daemon v36 的 socket 和 token。连接成功后会调用 `listSessions`，为每个
 仍在运行的 Orca 窗体建立一个只读 tab，并通过 `getSnapshot` 拉取当前快照；不会调用
 `createOrAttach(attachOnly)`，因此不会替换 Orca GUI 的输入 attachment。已存在的 Orca tab
-在 TUI 中不能输入或 resize；点击 tab 右侧的 `×` 只关闭 TUI 中的只读视图，不会终止 Orca
-会话。使用 tab 栏的 `+`/`n` 显式创建的新 tab 仍由 TUI 拥有并可交互。
+在 TUI 中不能输入或 resize；点击 tab 右侧的 `×` 会同步终止对应的 Orca 会话并关闭 Orca
+中的终端 tab。使用 tab 栏的 `+`/`n` 显式创建的新 tab 仍由 TUI 拥有并可交互。退出 TUI
+窗口也会同步终止当前展示的 Orca 会话；只读只表示不抢占输入 attachment，不表示关闭时保留会话。
 同时调用 `orca terminal list --include-visual-layouts --json`，按 `ptyId` 对齐 Orca 实际显示的
 标题、Agent 身份和 tab 顺序；这样 TUI 不会再用 cwd 或 bash/zsh 猜测 Agent 名称。切换 tab 不会
 创建新的 PTY。daemon 模式启动时是只读展示客户端，不会因为命令行参数自动创建 agent；使用 tab 栏的
@@ -158,10 +159,10 @@ token；当前仓库只提供服务端，不包含移动端页面。
 | 按键 | 作用 |
 |---|---|
 | `Ctrl+Alt+P` | 进入终端控制模式 |
-| `Ctrl+Q` / tab 栏 `× 退出` | 退出 TUI；attach/Orca daemon 模式下只断开展示客户端，不终止 daemon 会话 |
+| `Ctrl+Q` / tab 栏 `× 退出` | 退出 TUI；Orca daemon 模式同步关闭当前展示的 Orca 会话，内置 attach 模式只断开客户端 |
 | 鼠标滚轮 | 滚动当前终端历史输出 |
 | 鼠标点击 tab/workspace | 切换活动终端；横向 tab 仅属于当前工作区 |
-| 点击 tab 右侧 `×` | 关闭当前 TUI tab；只读 Orca tab 仅断开视图，不终止 Orca 会话 |
+| 点击 tab 右侧 `×` | 关闭当前 TUI tab，并同步关闭对应的 Orca 会话/tab |
 | 鼠标拖选 | 复制文本到系统剪贴板 |
 
 终端控制模式：

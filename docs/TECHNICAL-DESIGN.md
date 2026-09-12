@@ -108,12 +108,14 @@ daemon 实例。发现逻辑查找 Orca 的 versioned `daemon-v36.sock` / token�
 `getSnapshot`，把 `scrollbackAnsi + rehydrateSequences + snapshotAnsi` 注入对应 tab 的终端
 模拟器。不能把 `createOrAttach(attachOnly=true)` 当成只读操作：Orca v36 会先
 `detachAllClients()`，再把调用方设为新的 attachment，从而抢走 GUI 输入。已有会话在 TUI 中
-因此不发送输入、resize 或 kill；只有 tab 栏 `+`、`n` 或自定义命令入口显式创建的新会话才触发
-`createOrAttach`，并由 TUI 持有其 attachment。随后将新会话的 stream 事件按 session ID 路由，
-PTY 生命周期始终由 Orca daemon 管理。由于 daemon `listSessions` 只提供 PTY 状态，启动/重连时另行读取
+因此不发送输入或 resize；只有 tab 栏 `+`、`n` 或自定义命令入口显式创建的新会话才触发
+`createOrAttach`，并由 TUI 持有其 attachment。关闭已有 tab/窗口时只发送独立的 `kill` RPC，
+不改变 attachment ownership。随后将新会话的 stream 事件按 session ID 路由，PTY 生命周期始终由
+Orca daemon 管理。由于 daemon `listSessions` 只提供 PTY 状态，启动/重连时另行读取
 `orca terminal list --include-visual-layouts --json`，按稳定 `ptyId` 合并 Orca 的标题、
 `agentIdentity` 和视觉顺序；匹配不到的 live session 仍保留，但使用 daemon 的安全回退标签，
-并写入脱敏诊断计数。关闭 tab/退出 TUI 默认只断开当前展示客户端，不杀掉 Orca 会话。
+并写入脱敏诊断计数。只读快照只限制输入、resize 和 attachment ownership；关闭 tab 或退出
+TUI 时，会对当前展示的 Orca session 发送 `kill`，让 Orca GUI 同步移除对应终端 tab。
 
 维护协议适配时，必须同时核对 `src/orca/daemon.rs` 与同级 `../orca/src/main/daemon/` 中的
 client、stream reader、request router 和测试。不要仅依据旧文档中的字段名或帧格式。
@@ -201,7 +203,7 @@ tab 的单个终端 surface：
 
 tab 只是视图选择器；所有 tab 复用同一个 TUI 终端 surface，后端会话由 `PaneSlot` 持续消费，
 切回时直接显示最新状态。横向 tab 只投影当前焦点工作区的终端；鼠标点击 tab、`+` 或左侧
-workspace 均可导航，点击 tab 右侧 `×` 可关闭当前 TUI tab（只读 Orca tab 仅移除本地视图，
-不会发送 kill）；普通模式下 `Tab` / `Shift+Tab` 也只在该工作区内循环切换 tab。这样终端
+workspace 均可导航，点击 tab 右侧 `×` 可关闭当前 TUI tab 并发送对应 Orca session 的 `kill`；
+退出 TUI 窗口也会清理当前展示的 Orca sessions。普通模式下 `Tab` / `Shift+Tab` 也只在该工作区内循环切换 tab。这样终端
 尺寸按整个内容区同步给活动 PTY，不再按 split pane
 网格缩小，fullscreen TUI 与真实当前终端的行为保持一致。

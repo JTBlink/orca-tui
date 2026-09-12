@@ -1,9 +1,9 @@
 //! Terminal tab strip used by the main TUI.
 //!
-//! A tab is deliberately only a view selector. The underlying `PaneSlot`
-//! (and therefore its PTY session) stays alive while another tab is active.
-//! This mirrors Orca/Herdr's workspace → tabs model without creating split
-//! terminal surfaces in the current window.
+//! A tab is a view selector while it is active; switching tabs leaves the
+//! underlying `PaneSlot` (and its PTY session) alive. An explicit close uses
+//! the owning runtime's lifecycle path, mirroring Orca/Herdr's workspace →
+//! tabs model without creating split terminal surfaces in the current window.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};

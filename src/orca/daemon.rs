@@ -5,7 +5,8 @@
 //! orcatui connect to that daemon as a TUI client — giving it session
 //! persistence and structured agent status. Existing GUI sessions are read
 //! through `getSnapshot`; Orca v36's `createOrAttach` endpoint takes ownership
-//! of a session, so it is reserved for sessions created by this TUI.
+//! of a session, so it is reserved for sessions created by this TUI. Explicit
+//! close/exit cleanup uses the daemon's `kill` RPC without attaching input.
 //!
 //! ## Protocol (from the open-source daemon code)
 //!
@@ -629,6 +630,21 @@ impl DaemonClient {
         )
     }
 
+    /// Terminate a daemon-owned PTY. Unlike `createOrAttach`, this does not
+    /// change attachment ownership and is safe to use during TUI teardown.
+    pub fn kill_session(&mut self, session_id: &str) -> Result<(), DaemonError> {
+        self.rpc("kill", serde_json::json!({ "sessionId": session_id }))
+            .map(|_| ())
+    }
+
+    /// Shorten the control-socket deadline for best-effort teardown. Cleanup
+    /// must not keep a terminal window stuck in its closing path when Orca has
+    /// already gone away.
+    pub fn set_rpc_timeout(&mut self, timeout: Duration) {
+        self.control.set_read_timeout(Some(timeout)).ok();
+        self.control.set_write_timeout(Some(timeout)).ok();
+    }
+
     // ── Stream ────────────────────────────────────────────────────────
 
     /// Take the stream socket (moves it out — the caller owns it for blocking reads).
@@ -1172,6 +1188,37 @@ mod tests {
         });
         let payload = client.snapshot_session("session-a").unwrap();
         assert_eq!(payload["snapshot"]["snapshotAnsi"], "safe");
+    }
+
+    #[test]
+    fn kill_session_uses_non_attaching_kill_rpc() {
+        let (mut client, mut server) = make_test_client();
+        std::thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            let mut line = Vec::new();
+            loop {
+                match server.read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                        line.push(byte[0]);
+                    }
+                    Err(_) => break,
+                }
+            }
+            let request: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(request["type"], "kill");
+            assert_eq!(request["payload"]["sessionId"], "session-a");
+            server
+                .write_all(
+                    br#"{"id":"rpc-1","ok":true,"payload":{},"error":null}
+"#,
+                )
+                .unwrap();
+        });
+        client.kill_session("session-a").unwrap();
     }
 
     #[test]

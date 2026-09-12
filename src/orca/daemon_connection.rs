@@ -73,6 +73,17 @@ impl DaemonConnection {
         self.client.snapshot_session(session_id)
     }
 
+    /// Synchronously terminate a daemon session during TUI teardown. This
+    /// uses the long-lived control socket so the process cannot exit before a
+    /// fire-and-forget writer thread has delivered the close request.
+    pub(crate) fn kill_session(&mut self, session_id: &str) -> Result<(), DaemonError> {
+        self.client.kill_session(session_id)
+    }
+
+    pub(crate) fn set_rpc_timeout(&mut self, timeout: std::time::Duration) {
+        self.client.set_rpc_timeout(timeout);
+    }
+
     /// Read the daemon's best-effort foreground process name. This is used
     /// only as a fallback label for legacy sessions that do not carry Orca's
     /// structured `agentSessionOwners` metadata.
@@ -168,9 +179,9 @@ impl DaemonConnection {
         }
     }
 
-    /// Explicitly terminate a daemon-owned session. This is used only by the
-    /// pane close action (`x`); disconnecting the TUI or clicking the global
-    /// exit control never kills Orca sessions.
+    /// Explicitly terminate a daemon-owned session. The pane close action uses
+    /// the asynchronous path to keep input responsive; app teardown drains
+    /// the same IDs synchronously through [`Self::kill_session`].
     pub(crate) fn enqueue_kill(&mut self, session_id: String) {
         self.ensure_command_tx();
         if let Some(tx) = &self.command_tx {

@@ -26,9 +26,10 @@ pub(crate) struct PaneSlot {
     pub(crate) task: Option<TaskId>,
     pub(crate) daemon_session_id: Option<String>,
     /// Existing Orca sessions are hydrated through the read-only snapshot
-    /// RPC. They must never receive input or resize/kill requests from the
-    /// TUI, because Orca's createOrAttach endpoint replaces the GUI's
-    /// attachment owner.
+    /// RPC. They never receive input or resize requests from the TUI, because
+    /// Orca's createOrAttach endpoint replaces the GUI's attachment owner.
+    /// Explicit tab/window close is separate and sends a kill RPC so the two
+    /// clients converge on the same terminal lifecycle.
     pub(crate) daemon_read_only: bool,
     pub(crate) reconnect: Option<ReconnectSession>,
     pub(crate) reconnect_due: Option<Instant>,

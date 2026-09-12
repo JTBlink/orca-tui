@@ -19,6 +19,10 @@
 
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -267,6 +271,13 @@ pub struct App<B: Backend = CrosstermBackend<Stdout>> {
     toasts: crate::toast::ToastQueue,
     /// The daemon client when connected to an Orca daemon (None in standalone).
     daemon: Option<DaemonConnection>,
+    /// Daemon sessions whose TUI tab was closed and therefore must be killed
+    /// before the TUI exits. Keeping the IDs after removing the pane closes
+    /// the race where a user closes a tab and immediately quits the TUI.
+    daemon_cleanup_session_ids: Vec<String>,
+    /// Set by SIGHUP/SIGTERM/SIGINT so closing the terminal window follows
+    /// the same graceful cleanup path as Ctrl+Q.
+    shutdown_signal: Option<Arc<AtomicBool>>,
     /// In-memory activity timeline (state transitions + errors). Rendered as a
     /// full-screen overlay via `InputMode::Activity`.
     activity: ActivityLog,
@@ -551,6 +562,8 @@ impl App {
             conn_state: ConnectionState::Standalone,
             toasts: crate::toast::ToastQueue::new(),
             daemon: None,
+            daemon_cleanup_session_ids: Vec::new(),
+            shutdown_signal: None,
             activity: ActivityLog::new(),
             pane_rects: Vec::new(),
             tab_hitboxes: TabHitboxes::default(),
@@ -827,10 +840,17 @@ impl<B: Backend> App<B> {
     ///
     /// Propagates crossterm/ratatui I/O errors (e.g. stdout is not a TTY).
     pub fn run(&mut self) -> Result<()> {
+        self.shutdown_signal = Some(install_tui_shutdown_handlers());
         self.setup_terminal()?;
         let result = self.main_loop();
         // Always attempt teardown; surface it only if the loop itself succeeded.
-        if let Err(restore_err) = self.restore_terminal() {
+        let restore_result = self.restore_terminal();
+        // A TUI tab is a view of an Orca daemon terminal. Once the TUI window
+        // closes, terminate every represented daemon session so the Orca GUI
+        // removes the matching terminal too. This runs after raw-mode teardown
+        // because the RPC can wait for the daemon's response.
+        self.close_daemon_sessions();
+        if let Err(restore_err) = restore_result {
             if result.is_ok() {
                 return Err(restore_err);
             }
@@ -895,6 +915,14 @@ impl<B: Backend> App<B> {
         // keeps running. Only a PERSISTENT render failure bails out.
         let mut render_panic_streak = 0u32;
         while !self.quit {
+            if self
+                .shutdown_signal
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                self.request_quit();
+                continue;
+            }
             // Reap FIRST: poll each still-tracked child's real exit code before
             // draining the bus. The forwarder only knows the child is "gone"
             // (it emits `Exit{code: None}` on PTY EOF); the authoritative exit
@@ -3450,7 +3478,7 @@ impl<B: Backend> App<B> {
     fn apply_input_command(&mut self, command: InputCommand) {
         match command {
             InputCommand::Noop => {}
-            InputCommand::Quit => self.quit = true,
+            InputCommand::Quit => self.request_quit(),
             InputCommand::EnterPaneMode => self.mode = InputMode::Pane,
             InputCommand::SetNormalMode => self.mode = InputMode::Normal,
             InputCommand::Forward(key) => self.forward_key_to_agent(key),
@@ -3482,6 +3510,21 @@ impl<B: Backend> App<B> {
                 self.workspace_selected = 0;
             }
         }
+    }
+
+    fn request_quit(&mut self) {
+        self.quit = true;
+        self.queue_daemon_sessions_for_cleanup();
+    }
+
+    fn queue_daemon_sessions_for_cleanup(&mut self) {
+        self.daemon_cleanup_session_ids.extend(
+            self.panes
+                .iter()
+                .filter_map(|slot| slot.daemon_session_id.clone()),
+        );
+        self.daemon_cleanup_session_ids.sort();
+        self.daemon_cleanup_session_ids.dedup();
     }
 
     /// Jump-palette key handling: build the filter query, move the selection
@@ -3894,7 +3937,7 @@ impl<B: Backend> App<B> {
                     .footer_quit_hitbox
                     .is_some_and(|rect| contains(rect, col, row))
                 {
-                    self.quit = true;
+                    self.request_quit();
                     self.mode = InputMode::Normal;
                     self.drag_origin = None;
                     return;
@@ -3904,7 +3947,7 @@ impl<B: Backend> App<B> {
                     .quit
                     .is_some_and(|r| contains(r, col, row))
                 {
-                    self.quit = true;
+                    self.request_quit();
                     self.mode = InputMode::Normal;
                     self.drag_origin = None;
                     return;
@@ -4390,21 +4433,26 @@ impl<B: Backend> App<B> {
         }
         let idx = self.focus;
         // `x` is the explicit close/kill action. For a local pane this kills
-        // its PTY; for a TUI-owned Orca pane it sends the daemon's `kill` RPC.
-        // A read-only snapshot pane has no TUI-owned PTY, so this only drops
-        // the local view. The global Ctrl+Q / `× 退出` path never calls this
-        // method and thus only disconnects the viewer, preserving sessions.
-        if !self.panes[idx].daemon_read_only {
-            if let Some(session) = self.panes[idx].session.as_mut() {
-                let _ = session.kill();
-            }
-            if let Some(session_id) = self.panes[idx].daemon_session_id.clone() {
-                if let Some(daemon) = self.daemon.as_mut() {
+        // its PTY; for any Orca pane it sends the daemon's `kill` RPC. A
+        // read-only snapshot is not writable, but closing its TUI tab is still
+        // an explicit request to close the matching Orca terminal.
+        if let Some(session) = self.panes[idx].session.as_mut() {
+            let _ = session.kill();
+        }
+        if let Some(session_id) = self.panes[idx].daemon_session_id.clone() {
+            self.daemon_cleanup_session_ids.push(session_id.clone());
+            if let Some(daemon) = self.daemon.as_mut() {
+                if self.panes[idx].daemon_read_only {
+                    // Read-only tabs still close their matching Orca PTY, but
+                    // use the control socket directly so the GUI converges
+                    // before the TUI redraws the next tab.
+                    let _ = daemon.kill_session(&session_id);
+                } else {
                     daemon.enqueue_kill(session_id.clone());
                 }
-                if let Some(session_map) = &self.daemon_session_map {
-                    session_map.lock().unwrap().remove(&session_id);
-                }
+            }
+            if let Some(session_map) = &self.daemon_session_map {
+                session_map.lock().unwrap().remove(&session_id);
             }
         }
         // Dropping one slot removes the PTY and every item of pane-owned state
@@ -4434,6 +4482,31 @@ impl<B: Backend> App<B> {
             None
         } else {
             self.panes.get_mut(self.focus).map(|slot| &mut slot.pane)
+        }
+    }
+
+    /// Kill all Orca sessions represented by this TUI before disconnecting.
+    /// Session IDs are retained after a tab close so a close-then-quit race
+    /// cannot leave the GUI terminal alive. Errors are best effort: the TUI is
+    /// already exiting and a daemon that disappeared needs no further action.
+    fn close_daemon_sessions(&mut self) {
+        let mut session_ids = std::mem::take(&mut self.daemon_cleanup_session_ids);
+        session_ids.extend(
+            self.panes
+                .iter()
+                .filter_map(|slot| slot.daemon_session_id.clone()),
+        );
+        session_ids.sort();
+        session_ids.dedup();
+
+        let Some(mut daemon) = self.daemon.take() else {
+            return;
+        };
+        daemon.set_rpc_timeout(Duration::from_millis(750));
+        for session_id in session_ids {
+            if let Err(error) = daemon.kill_session(&session_id) {
+                eprintln!("orcatui: failed to close Orca session {session_id}: {error}");
+            }
         }
     }
 
@@ -4570,8 +4643,46 @@ fn parse_stream_event(
     Some((pane_id, code))
 }
 
+/// Install terminal-window shutdown handlers. macOS Terminal and most Unix
+/// terminals send SIGHUP when their window is closed; SIGTERM covers process
+/// supervisors, and SIGINT keeps Ctrl+C on the same cleanup path while raw
+/// mode is active. The handler only flips an atomic flag; all terminal and RPC
+/// work remains on the TUI thread.
+fn install_tui_shutdown_handlers() -> Arc<AtomicBool> {
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+
+    static mut SHUTDOWN_FLAG: Option<Arc<AtomicBool>> = None;
+    let flag = Arc::new(AtomicBool::new(false));
+
+    extern "C" fn tui_shutdown_signal_handler(_sig: i32) {
+        // SAFETY: the static is initialized before handlers are installed and
+        // only an atomic store occurs in the signal context.
+        unsafe {
+            let ptr = &raw const SHUTDOWN_FLAG;
+            if let Some(flag) = &*ptr {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    unsafe {
+        SHUTDOWN_FLAG = Some(Arc::clone(&flag));
+        let handler = tui_shutdown_signal_handler as *const () as usize;
+        signal(1, handler); // SIGHUP
+        signal(2, handler); // SIGINT
+        signal(15, handler); // SIGTERM
+    }
+    flag
+}
+
 impl<B: Backend> Drop for App<B> {
     fn drop(&mut self) {
+        // Covers panic paths and callers that construct an App without
+        // entering `run`; the normal path already took the same connection in
+        // `run`, so this is a no-op after a clean exit.
+        self.close_daemon_sessions();
         // Panic-safety: if `run` never restored (or panicked mid-loop), make
         // one best-effort attempt to give the user their terminal back. The
         // `PtySession` drops below kill+join any still-running agents.
@@ -4645,6 +4756,8 @@ mod tests {
                 conn_state: ConnectionState::Standalone,
                 toasts: crate::toast::ToastQueue::new(),
                 daemon: None,
+                daemon_cleanup_session_ids: Vec::new(),
+                shutdown_signal: None,
                 activity: ActivityLog::new(),
                 pane_rects: Vec::new(),
                 tab_hitboxes: TabHitboxes::default(),
@@ -5464,7 +5577,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_read_only_daemon_tab_only_removes_tui_view() {
+    fn closing_read_only_daemon_tab_queues_orca_close() {
         let mut app = App::for_test(vec![pane(0, "orca-session")]);
         app.panes[0].daemon_session_id = Some("session-1".to_owned());
         app.panes[0].daemon_read_only = true;
@@ -5480,6 +5593,11 @@ mod tests {
         assert!(
             app.panes.is_empty(),
             "read-only tab can be dismissed locally"
+        );
+        assert_eq!(
+            app.daemon_cleanup_session_ids,
+            vec!["session-1"],
+            "closing an Orca tab queues its daemon session for synchronized cleanup"
         );
         assert!(app.daemon_session_map.is_none());
     }
@@ -5499,7 +5617,25 @@ mod tests {
         assert_eq!(
             app.panes.len(),
             2,
-            "exit does not kill or remove a daemon tab"
+            "exit waits for teardown to close daemon tabs"
+        );
+    }
+
+    #[test]
+    fn global_quit_queues_orca_sessions_for_window_cleanup() {
+        let mut app = App::for_test(vec![pane(0, "orca-a"), pane(1, "orca-b")]);
+        for (slot, session_id) in app.panes.iter_mut().zip(["session-a", "session-b"]) {
+            slot.daemon_session_id = Some(session_id.to_owned());
+            slot.daemon_read_only = true;
+        }
+
+        app.request_quit();
+
+        assert!(app.quit);
+        assert_eq!(
+            app.daemon_cleanup_session_ids,
+            vec!["session-a", "session-b"],
+            "closing the TUI window must retain every Orca session for final kill RPCs"
         );
     }
 
