@@ -2221,6 +2221,14 @@ impl<B: Backend> App<B> {
             stop.store(true, Ordering::Relaxed);
         }
         self.orca_send_tx = None;
+        if let Some(bridge) = self.orca_cli.clone() {
+            let pending = std::mem::take(&mut self.orca_spawn_rx);
+            for (_, rx) in pending {
+                if let Ok(Ok(created)) = rx.recv_timeout(Duration::from_millis(200)) {
+                    let _ = bridge.close_tab(&created.handle);
+                }
+            }
+        }
     }
 
     pub fn enable_reconnect(&mut self) {
