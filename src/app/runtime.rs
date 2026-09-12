@@ -1251,10 +1251,14 @@ impl<B: Backend> App<B> {
                     .collect();
                 self.panes.retain(|slot| match slot.session_owner {
                     SessionOwner::Local => true,
-                    SessionOwner::OrcaExisting | SessionOwner::OrcaTuiOwned => slot
+                    SessionOwner::OrcaExisting => slot
                         .orca_handle
                         .as_ref()
-                        .map_or(true, |handle| handles.contains(handle)),
+                        .is_some_and(|handle| handles.contains(handle)),
+                    SessionOwner::OrcaTuiOwned => slot
+                        .orca_handle
+                        .as_ref()
+                        .is_none_or(|handle| handles.contains(handle)),
                 });
                 if self.panes.is_empty() {
                     self.focus = 0;
